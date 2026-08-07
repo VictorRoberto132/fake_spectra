@@ -1,6 +1,13 @@
 # -*- coding: utf-8 -*-
 """Python module for generating fake spectra from an N-body catalogue.
 
+INSTALL: this file REPLACES fake_spectra/spectra.py inside the installed
+package (it uses package-relative imports and the compiled _spectra_priv
+extension, so it cannot be imported loose from a working directory):
+
+    SP=$(python -c 'import fake_spectra.spectra as s; print(s.__file__)')
+    cp "$SP" "$SP.backup" ; cp spectra.py "$SP"
+
 Note in Arepo we have GFM_Metals and GFM_Metallicity.
 
 GFM_Metallicity is the total mass in species not H or He
@@ -17,11 +24,11 @@ sum(GFM_Metals[:2]) +  GFM_Metallicity ~ 1
 
 Also note that there is some instability at very low metallicities - the code will often return +-1e-20.
 """
-
 from __future__ import print_function
 import os
 import os.path as path
 import shutil
+
 import numpy as np
 import h5py
 
@@ -33,8 +40,8 @@ from . import voigtfit
 from . import spec_utils
 from . import fluxstatistics as fstat
 from ._spectra_priv import _Particle_Interpolate, _near_lines
-
 from .cloudy_tables import convert_cloudy
+
 def _get_cloudy_table(red, cdir=None):
     """Get the cloudy table if we didn't already"""
     #Generate cloudy tables
@@ -47,6 +54,34 @@ try:
     xrange(1)
 except NameError:
     xrange = range
+
+# ---------------------------------------------------------------------------
+# Two distinct HCD thresholds. DO NOT confuse them:
+#  * SEED (particle level), log10 N_HI = 16.5: used only inside the "auto"
+#    Schaye-2001 inversion below to nucleate the region growing. Deliberately
+#    BELOW the observational 17.2 so the grown structure cannot clip a genuine
+#    HCD -- the safety margin lives here.
+#  * SELECTION (sightline level), log10 N_HI = 17.2: applied to the INTEGRATED
+#    N_HI of each sightline afterwards (utils.SpectrumEngine does this) to keep
+#    only real HCDs. The DLA-family helper functions near the bottom of this
+#    file default to it as well.
+# ---------------------------------------------------------------------------
+HCD_SEED_LOGNHI = 16.5
+HCD_SELECTION_LOGNHI = 17.2
+HCD_SELECTION_THRESH = 10**HCD_SELECTION_LOGNHI
+
+#: filter_mode values understood by the HCD decomposition.
+#: "HCD_only"    -> keep only cells assigned to the HCD structure
+#:                  (formerly called "DLAs")
+#: "Forest_only" -> the complementary forest-only field
+#:                  (formerly called "No_DLAs")
+#: "None"        -> stock fake_spectra behaviour, all cells.
+FILTER_MODES = ("None", "HCD_only", "Forest_only")
+
+#: Pre-rename spellings, accepted for backwards compatibility and silently
+#: normalised in Spectra.__init__ (and by the pipeline entry points).
+#: Pure aliasing -- no thresholds or logic differ between old and new names.
+LEGACY_FILTER_MODES = {"DLAs": "HCD_only", "No_DLAs": "Forest_only"}
 
 class Spectra:
     """Class to interpolate particle densities along a line of sight and calculate their absorption
@@ -74,22 +109,38 @@ class Spectra:
                       Default is gas_properties.GasProperties which reads both of these from the particle output.
             gasprop_args - Dictionary of extra arguments to be fed to gasprop, if gasprop is not the default.
             kernel - Interpolation method to use. The default is to select the method based on the type of simulation:
-                     this will use a Voronoi mesh build if we are Arepo and an SPH kernel for Gadget.
-                     Other options are "voronoi" which forces the Voronoi kernel, "tophat" which forces a flat tophat
-                     kernel (a good back up for large Arepo simulations) "quintic" for a quintic SPh kernel as used in modern SPH
-                     and "cubic" or "sph" for an old-school cubic SPH kernel.
+                      this will use a Voronoi mesh build if we are Arepo and an SPH kernel for Gadget.
+                      Other options are "voronoi" which forces the Voronoi kernel, "tophat" which forces a flat tophat
+                      kernel (a good back up for large Arepo simulations) "quintic" for a quintic SPh kernel as used in modern SPH
+                      and "cubic" or "sph" for an old-school cubic SPH kernel.
             use_external_Hz - user provided value for H(z) [km/s/Mpc] to be used
-                     when converting comoving to velocity units.
-                     If not proviced, will assume flat LCDM and compute it.
-    """
-    def __init__(self, num, base, cofm, axis, MPI=None, res=1., cdir=None, savefile="spectra.hdf5",
-                 savedir=None, reload_file=False, spec_res = 0,load_halo=False, units=None, sf_neutral=True,
-                 quiet=False, load_snapshot=True, gasprop=None, gasprop_args=None, kernel=None, use_external_Hz=None):
+                      when converting comoving to velocity units.
+                      If not proviced, will assume flat LCDM and compute it.
 
+        HCD fork arguments:
+            filter_mode - "None" (stock), "HCD_only" (HCD structure only;
+                      formerly "DLAs") or "Forest_only" (complementary
+                      forest-only field; formerly "No_DLAs"). The legacy
+                      spellings are still accepted and silently normalised.
+            hcd_phys_thresh - "auto" inverts Schaye 2001 + Rahmati 2012 for the
+                      SEED column HCD_SEED_LOGNHI (=16.5); or a float n_H in cm^-3.
+                      (Renamed from dla_phys_thresh; same numbers, same logic.)
+            halo_r200 - R200 of the target halo, simulation length units. If set,
+                      only cores within +- halo_radius_cut * R200 of the halo
+                      centre (along the LOS axis) are accepted.
+            halo_radius_cut - window half-width in units of R200 (default 5).
+    """
+    def __init__(self, num, base, cofm, axis, MPI=None, nbins=None, res=1., cdir=None, savefile="spectra.hdf5",
+             savedir=None, reload_file=False, spec_res = 0,load_halo=False, units=None, sf_neutral=True, turn_off_selfshield=False,
+             quiet=False, load_snapshot=True, gasprop=None, gasprop_args=None, kernel=None, use_external_Hz=None,
+             filter_mode="None", hcd_phys_thresh="auto",
+             halo_r200=None, halo_radius_cut=5.0):
+        
         #Present for compatibility. Functionality moved to HaloAssignedSpectra
         _= load_halo
         self.num = num
         self.base = base
+
         # Adpot the MPI communiactor if desired
         self.MPI = MPI
         if MPI is not None:
@@ -100,11 +151,26 @@ class Spectra:
             self.comm = None
             self.rank = 0
             self.size = 1
+
+        # Legacy spellings from the DLA-era API ("DLAs", "No_DLAs") are
+        # accepted and normalised to the current names. Pure renaming.
+        filter_mode = LEGACY_FILTER_MODES.get(filter_mode, filter_mode)
+        # FIX: validate filter_mode up front. A typo (e.g. "HCD") used to die much
+        # later with an UnboundLocalError on mask_keep, deep inside the filter loop.
+        if filter_mode not in FILTER_MODES:
+            raise ValueError("filter_mode must be one of %s, got %r" % (FILTER_MODES, filter_mode))
+        # FIX: the filter path iterates ALL segments on every rank; under MPI the
+        # final Allreduce(SUM) would multiply the result by the number of ranks.
+        if MPI is not None and filter_mode != "None":
+            raise ValueError("filter_mode != 'None' requires MPI=None (the HCD filter "
+                             "loads the whole snapshot on one rank).")
+
         #Create the unit system
         if units is not None:
             self.units = units
         else:
             self.units = unitsystem.UnitSystem()
+
         #Empty dictionary to add results to
         self.tau_obs = {}
         self.tau = {}
@@ -120,14 +186,15 @@ class Spectra:
         #This variable should be set to true once the sightlines are fixed, and the cache can be used.
         self.cofm_final = False
         self.num_important = {}
-
         self.discarded=0
         self.npart=0
+        self.turn_off_selfshield = turn_off_selfshield
 
         self.spec_res = spec_res
         self.cdir = cdir
         #Minimum length of spectra within which to look at metal absorption (in km/s)
         self.minwidth = 500.
+
         #Stopping criterion for optical depth: if a particle is adding less
         #than this to a pixel, stop the integration.
         self.tautail = 1e-7
@@ -148,9 +215,12 @@ class Spectra:
             elif kernel == "sph":
                 self.kernel_int = 1
             else:
-                raise ValueError("Unrecognised kernel %d" % kernel)
+                # FIX: kernel is a string; the old "%d" raised a TypeError
+                # instead of the intended message.
+                raise ValueError("Unrecognised kernel %s" % kernel)
         except IOError:
             pass
+
         if savedir is None:
             #Use snapdir if exists, otherwise use SPEC_
             savedir = path.join(base, "snapdir_"+str(num).rjust(3, '0'))
@@ -158,11 +228,14 @@ class Spectra:
             if not path.exists(savedir):
                 savedir = path.join(base, "SPECTRA_"+str(num).rjust(3, '0'))
         self.savefile = path.join(savedir, savefile)
-
         #Snapshot data
         if reload_file:
             if not quiet:
                 print("Reloading from snapshot (will save to: ", self.savefile, " )", flush=True)
+            # FIX: the None check must come BEFORE .astype -- otherwise a None
+            # cofm crashed with AttributeError instead of the intended message.
+            if cofm is None or axis is None:
+                raise RuntimeError("None was passed for cofm or axis. If you are trying to load from a savefile, use reload_file=False.")
             #Make sure the obvious syntax for a single sightline works
             if np.shape(cofm) == (3,):
                 cofm = np.array([cofm,])
@@ -170,8 +243,6 @@ class Spectra:
             if np.shape(axis) == ():
                 axis = np.array([axis])
             self.axis = axis.astype(np.int32)
-            if cofm is None or axis is None:
-                raise RuntimeError("None was passed for cofm or axis. If you are trying to load from a savefile, use reload_file=False.")
             try:
                 self.npart = self.snapshot_set.get_npart()
                 #If we got here without a snapshot_set, we really have an IOError
@@ -203,24 +274,30 @@ class Spectra:
             if not quiet:
                 print("Reading pre-computed spectra (from file", self.savefile, " )", flush=True)
             self.load_savefile(self.savefile)
-
         # Conversion factors from internal units
-        self.rscale = (self.units.UnitLength_in_cm*self.atime)/self.hubble
+        self.rscale = np.float32((self.units.UnitLength_in_cm*self.atime)/self.hubble)
         #Convert comoving internal units to physical km/s.
         if self.Hz is None:
             #Assume flat LCDM cosmology to compute H(z) (in km/s/Mpc)
             self.Hz = 100.0*self.hubble * np.sqrt(self.OmegaM/self.atime**3 + self.OmegaLambda)
+
         #Numerical constant is 1 Mpc in cm.
         self.velfac = self.rscale * self.Hz / 3.085678e24
         self.vmax = self.box * self.velfac # box size (physical kms^-1)
         self.NumLos = np.size(self.axis)
+
         # specify pixel width and number of pixels in spectra
         if reload_file:
             # if reloading from snapshot, pixel width must have been defined
             if res is None:
-                raise ValueError('pixel width (res) not provided')
-            # nbins must be an integer
-            self.nbins=int(self.vmax/res)
+                if nbins is not None:
+                   self.nbins = nbins
+                   res = self.vmax/(1.*nbins)
+                else:
+                   raise ValueError('pixel width (res) not provided')
+            if nbins is None:
+                # nbins must be an integer
+                self.nbins=int(self.vmax/res)
             # velocity bin size (kms^-1)
             self.dvbin = self.vmax / (1.*self.nbins)
         else:
@@ -232,6 +309,7 @@ class Spectra:
             # check if you asked for different H(z) than the one in the file
             if use_external_Hz:
                 assert np.isclose(self.Hz,use_external_Hz,rtol=1e-4),'Hz error'
+
         #Species we can use: Z is total metallicity
         self.species = ['H', 'He', 'C', 'N', 'O', 'Ne', 'Mg', 'Si', 'Fe', 'Z']
         #Solar abundances from Asplund 2009 / Grevasse 2010 (which is used in Cloudy 13, Hazy Table 7.4).
@@ -242,6 +320,7 @@ class Spectra:
         self.solarz = 0.0134/0.7381
         #Line data
         self.lines = line_data.LineData()
+
         #Load the class for computing gas properties such as temperature from the raw simulation.
         if gasprop is None:
             gasprop = gas_properties.GasProperties
@@ -255,6 +334,71 @@ class Spectra:
             pass
         if not quiet:
             print(self.NumLos, " sightlines. resolution: ", self.dvbin, " z=", self.red)
+
+        # =====================================================================
+        # DYNAMIC HCD SEED THRESHOLD (Schaye 2001 + Rahmati 2012)
+        # =====================================================================
+        self.filter_mode = filter_mode
+        #self.hcd_mask_radius = hcd_mask_radius
+        
+        if self.filter_mode != "None":
+            if hcd_phys_thresh == "auto":
+                from scipy.optimize import root_scalar
+                
+                # Solve for n_H because the Jeans length approximation requires total density.
+                def target_function(log_nH):
+                    nH = 10**log_nH
+                    f_HI = self.gasprop._neutral_fraction(nH, 1e4)
+                    N_H = 1.6e21 * np.sqrt(nH)
+                    N_HI = f_HI * N_H
+                    # SEED at 10^16.5: smaller than the 10^17.2 HCD definition on
+                    # purpose. The Schaye 2001 approximation is not exact and we
+                    # want a safety margin so no genuine HCD particle is missed;
+                    # the strict 17.2 cut is applied later to the integrated
+                    # sightline N_HI (see utils.SpectrumEngine).
+                    return np.log10(N_HI) - HCD_SEED_LOGNHI
+                
+                res = root_scalar(target_function, bracket=[-5.0, 2.0], method='brentq')
+                self.hcd_phys_thresh_nH = 10**res.root
+                
+                # Map the n_H threshold to its corresponding n_HI threshold at T=10^4K.
+                f_HI_thresh = self.gasprop._neutral_fraction(self.hcd_phys_thresh_nH, 1e4)
+                self.hcd_phys_thresh_nHI = self.hcd_phys_thresh_nH * f_HI_thresh
+                
+                if not quiet:
+                    # FIX: this print used to claim 10^17.2 while the solver
+                    # targeted 16.5. Now it tells the truth.
+                    print(f"Auto HCD SEED threshold for z={self.red:.2f} (log10 N_HI = {HCD_SEED_LOGNHI}; "
+                          f"safety margin below the {HCD_SELECTION_LOGNHI} selection cut):", flush=True)
+                    print(f" -> Total Hydrogen trigger (nH): {self.hcd_phys_thresh_nH:.5e} atoms/cm^3", flush=True)
+                    print(f" -> Neutral Hydrogen trigger (nHI): {self.hcd_phys_thresh_nHI:.5e} atoms/cm^3", flush=True)
+            else:
+                self.hcd_phys_thresh_nH = float(hcd_phys_thresh)
+                f_HI_thresh = self.gasprop._neutral_fraction(self.hcd_phys_thresh_nH, 1e4)
+                self.hcd_phys_thresh_nHI = self.hcd_phys_thresh_nH * f_HI_thresh
+
+        # =====================================================================
+        # HALO-CENTRIC LOCALIZATION FOR HCD CORE SELECTION
+        # =====================================================================
+        # If a halo R200 is provided, only HCD cores within
+        # ± halo_radius_cut * R200 of the sightline center (along the LOS axis)
+        # are accepted. Cores outside this window are ignored, so distant
+        # systems intersected by the LOS do not contaminate the target halo's
+        # HCD signal. They are instead bled into the Forest_only (forest)
+        # channel.
+        #
+        # NOTE ("halo no centro"): the window is anchored on the sightline's
+        # own coordinate along the LOS axis. This equals the HALO CENTRE
+        # because radii_skewers builds cofm = halo_cm + offset with ZERO offset
+        # along the LOS axis. If you ever generate cofm differently, the window
+        # anchors wherever that coordinate points.
+        self.halo_r200 = halo_r200
+        self.halo_radius_cut = halo_radius_cut
+
+        if self.filter_mode != "None" and self.halo_r200 is not None and not quiet:
+            print(f"Halo-centric HCD core selection ENABLED:", flush=True)
+            print(f" -> R200 = {self.halo_r200} (sim units)", flush=True)
+            print(f" -> Acceptance window: ±{self.halo_radius_cut} R200 around sightline center", flush=True)        
 
     def save_file(self):
         """
@@ -273,10 +417,11 @@ class Spectra:
                 pass
             #Make sure the directory exists
             if not path.exists(path.dirname(self.savefile)):
-                os.mkdir(path.dirname(self.savefile))
+                os.makedirs(path.dirname(self.savefile), exist_ok=True)
             #Make a backup.
             if path.exists(self.savefile):
                 shutil.move(self.savefile, self.savefile+".backup")
+
             try:
                 f = h5py.File(self.savefile, 'w')
             except IOError as io:
@@ -296,6 +441,14 @@ class Spectra:
         grp.attrs["discarded"] = self.discarded
         grp.attrs["npart"] = self.npart
         grp.attrs["Hz"] = self.Hz
+        # HCD provenance
+        grp.attrs["filter_mode"] = str(self.filter_mode)
+        if self.filter_mode != "None":
+            grp.attrs["hcd_seed_lognhi"] = HCD_SEED_LOGNHI
+            grp.attrs["hcd_thresh_nH"] = self.hcd_phys_thresh_nH
+            grp.attrs["hcd_thresh_nHI"] = self.hcd_phys_thresh_nHI
+            grp.attrs["halo_radius_cut"] = self.halo_radius_cut
+            grp.attrs["halo_r200"] = -1.0 if self.halo_r200 is None else float(self.halo_r200)
         grp = f.create_group("spectra")
         grp["cofm"] = self.cofm
         grp["axis"] = self.axis
@@ -389,7 +542,6 @@ class Spectra:
                 flux[ii]+= noise
         return (flux, noise_array)
 
-
     def add_cont_error(self, CE, flux, spec_num=-1, u_delta=0.6, l_delta=-0.6):
         """Adding the Continuum error to spectra. If you want to add both random noise and continuum error, first add
         the continuum error and then the random noise. Follow the prescription in eq 2 of arxiv:2112.03930:
@@ -422,7 +574,6 @@ class Spectra:
                     delta[ii] = np.random.normal(0, CE[ii])
                 flux[ii,:] /= (1.0 + delta[ii])
         return (flux , delta)
-
 
     def load_savefile(self, savefile=None):
         """Load data from a file"""
@@ -491,38 +642,51 @@ class Spectra:
                 else:
                     self.Hz = None
 
-    def _interpolate_single_file(self, nsegment, elem, ion, ll, get_tau, load_all_data_first=False):
-        """Read arrays and perform interpolation for a single file"""
-        (pos, vel, elem_den, temp, hh, amumass) = self._read_particle_data(nsegment, elem, ion, get_tau)
+    def _interpolate_single_file(self, nsegment, elem, ion, ll, get_tau, load_all_data_first=False, weight=None):
+        """Read arrays and perform interpolation for a single file.
+
+        weight: None (default) interpolates the ionic density itself (tau or
+        colden depending on get_tau). weight="temp" interpolates
+        elem_den * T / pixel_length instead, i.e. the NUMERATOR of the
+        density-weighted temperature. The HCD mask is always computed from the
+        pure ionic density, so the same cells enter numerator and denominator.
+        """
+        assert weight in (None, "temp")
+        if weight is not None:
+            assert not get_tau, "weighted interpolation is a get_tau=False quantity"
+        # Temperature must be loaded (and pooled) even though get_tau is False.
+        read_tau = get_tau or (weight == "temp")
+        
+        # --- GLOBAL SKEWER AWARENESS FOR TOPOLOGICAL FILTERING ---
+        if hasattr(self, 'filter_mode') and self.filter_mode != "None":
+            load_all_data_first = True
+            
+        (pos, vel, elem_den, temp, hh, amumass, den) = self._read_particle_data(nsegment, elem, ion, read_tau)
+        
         if load_all_data_first:
             for nseg in range(1, self.snapshot_set.get_n_segments()):
-                (pos_, vel_, elem_den_, temp_, hh_, amumass_) = self._read_particle_data(nseg, elem, ion, get_tau)
+                (pos_, vel_, elem_den_, temp_, hh_, amumass_, den_) = self._read_particle_data(nseg, elem, ion, read_tau)
                 if amumass_ is False:
                     continue
-                # We cannot concatenate onto empty arrays,
-                #so if the first segment contained no particles we must rename
                 if amumass is False:
-                    pos = pos_
-                    vel = vel_
-                    temp = temp_
-                    elem_den = elem_den_
-                    hh = hh_
+                    pos, vel, temp, elem_den, hh, den = pos_, vel_, temp_, elem_den_, hh_, den_
                 else:
                     pos = np.concatenate((pos, pos_), axis=0)
-                    if get_tau:
+                    if read_tau:
                         vel = np.concatenate((vel, vel_), axis=0)
                     elem_den = np.append(elem_den, elem_den_)
-                    if get_tau or (ion != -1 and elem != 'H'):
+                    if read_tau or (ion != -1 and elem != 'H'):
                         temp = np.append(temp, temp_)
                     hh = np.append(hh, hh_)
+                    den = np.append(den, den_)
                 amumass = amumass_
+                
         if amumass is False:
             return np.zeros([np.shape(self.cofm)[0], self.nbins], dtype=np.float32)
+
+        # Early line extraction
         if get_tau:
-            #Allow us to compute absorption profiles assuming all
-            #of one element is in the absorbing state
             if ion == -1:
-                #Slight hack: try every ion in turn until we find the one with this line
                 for ii in range(8):
                     try:
                         line = self.lines[(elem, ii)][ll]
@@ -532,82 +696,307 @@ class Spectra:
             else:
                 line = self.lines[(elem, ion)][ll]
         else:
-            #If get_tau is false, we don't use the line data
-            #(only the density), so we can set this as we like.
-            #Setting something makes writing the interfaces easier,
-            #because C doesn't have default arguments.
             line = self.lines[("H", 1)][1215]
-        # print(pos.shape, vel.shape, elem_den.shape, temp.shape, hh.shape, amumass)
-        return self._do_interpolation_work(pos, vel, elem_den, temp, hh, amumass, line, get_tau)
 
+        # Array that actually goes to the C interpolator. The mask below is
+        # ALWAYS computed from the pure elem_den (n_HI), never from this.
+        if weight == "temp":
+            phys = np.float32(self.dvbin/self.velfac*self.rscale)
+            interp_den = elem_den * temp / phys
+        else:
+            interp_den = elem_den
+
+        # =====================================================================
+        # HYBRID 1D REGION GROWING FILTERING (KERNEL AWARE) - BATCH IN RAM
+        # =====================================================================
+        if hasattr(self, 'filter_mode') and self.filter_mode != "None":
+            
+            core_thresh_nHI = self.hcd_phys_thresh_nHI
+            envelope_thresh_nH = getattr(self, 'hcd_envelope_thresh',
+                                         getattr(self, 'dla_envelope_thresh',
+                                                 self.hcd_phys_thresh_nH * 0.01))
+            gap_tolerance = getattr(self, 'gap_tolerance', 10)
+
+            # Pre-allocate the master array for all skewers
+            final_interpolated_array = np.zeros([self.NumLos, self.nbins], dtype=np.float32)
+
+            # --- PROCESS EACH SKEWER FROM LOADED RAM DATA ---
+            for i_los in range(self.NumLos):
+                
+                single_axis = np.array([self.axis[i_los]], dtype=np.int32)
+                single_cofm = np.array([self.cofm[i_los]], dtype=np.float64)
+                
+                # 1. EXTRACT PARTICLES EXACTLY AS OLD METHOD DID (Bit-for-bit parity)
+                # Usamos a rotina nativa em C para garantir que as partículas sejam
+                # exatamente as mesmas que o método antigo selecionava.
+                ind_sk = self.particles_near_lines(pos, hh, single_axis, single_cofm)
+                
+                if len(ind_sk) == 0:
+                    continue
+                    
+                pos_sk = pos[ind_sk]
+                hh_sk = hh[ind_sk]
+                elem_den_sk = elem_den[ind_sk]
+                interp_den_sk = interp_den[ind_sk]
+                den_sk = den[ind_sk]
+                
+                vel_sk = vel[ind_sk] if len(vel) == len(pos) else vel
+                temp_sk = temp[ind_sk] if len(temp) == len(pos) else temp
+                
+                # 2. CALCULATE PERPENDICULAR DISTANCE AND ATTENUATION
+                ax_idx = self.axis[i_los] - 1  
+                idx_other = [0, 1, 2]
+                idx_other.remove(ax_idx)
+                
+                dy = np.abs(pos_sk[:, idx_other[0]] - single_cofm[0, idx_other[0]])
+                dy = np.where(dy > self.box / 2.0, self.box - dy, dy) # PBC
+                dz = np.abs(pos_sk[:, idx_other[1]] - single_cofm[0, idx_other[1]])
+                dz = np.where(dz > self.box / 2.0, self.box - dz, dz) # PBC
+                
+                d_perp_sk = np.sqrt(dy**2 + dz**2)
+                
+                x_1d = pos_sk[:, ax_idx]
+                sort_idx = np.argsort(x_1d)
+                x_1d_s = x_1d[sort_idx] # Sorted physical coordinates
+                
+                q = d_perp_sk / hh_sk
+                w_attenuation = np.zeros_like(q)
+                
+                if self.kernel_int == 1:
+                    mask1 = q <= 0.5
+                    mask2 = (q > 0.5) & (q <= 1.0)
+                    w_attenuation[mask1] = 1.0 - 6.0 * q[mask1]**2 + 6.0 * q[mask1]**3
+                    w_attenuation[mask2] = 2.0 * (1.0 - q[mask2])**3
+                else:
+                    mask_intersect = q <= 1.0
+                    w_attenuation[mask_intersect] = np.sqrt(1.0 - q[mask_intersect]**2)
+
+                nH_phys_intrinsic = den_sk * 0.76
+                nHI_phys_intrinsic = (elem_den_sk / self.rscale) * amumass
+                
+                nH_eff_skewer = nH_phys_intrinsic * w_attenuation
+                nHI_eff_skewer = nHI_phys_intrinsic * w_attenuation
+                
+                den_nH_s = nH_eff_skewer[sort_idx] 
+                den_nHI_s = nHI_eff_skewer[sort_idx] 
+                hh_s = hh_sk[sort_idx]
+                
+                part_of_hcd_s = np.zeros(len(den_nH_s), dtype=bool)
+                
+                # 3. Find the Cores (SEED threshold, see HCD_SEED_LOGNHI)
+                core_indices = np.where(den_nHI_s >= core_thresh_nHI)[0]
+                
+                # 3b. HALO-CENTRIC CORE FILTERING
+                # Only keep cores within ±N*R200 of the sightline center along the LOS axis.
+                # This guarantees that secondary HCDs intersected by chance along the
+                # line of sight are NOT classified as belonging to the target halo.
+                # (The sightline center along the LOS axis == the halo centre,
+                #  by construction of cofm in radii_skewers.)
+                if (self.halo_r200 is not None) and (len(core_indices) > 0):
+                    # Sightline center coordinate along the LOS axis (sim units)
+                    los_center = single_cofm[0, ax_idx]
+                    
+                    # Physical positions of the candidate cores along the LOS axis
+                    core_positions = x_1d_s[core_indices]
+                    
+                    # Periodic distance from sightline center
+                    d_core = np.abs(core_positions - los_center)
+                    d_core = np.where(d_core > self.box / 2.0, self.box - d_core, d_core)
+                    
+                    # Acceptance window
+                    window = self.halo_radius_cut * self.halo_r200
+                    
+                    keep_core_mask = d_core <= window
+                    core_indices = core_indices[keep_core_mask]
+                
+                # 4. Region Growing (only from accepted cores)
+                for idx in core_indices:
+                    if part_of_hcd_s[idx]: continue 
+                        
+                    right_idx = idx
+                    last_valid_right = idx
+                    while right_idx < len(den_nH_s):
+                        if den_nH_s[right_idx] >= envelope_thresh_nH:
+                            last_valid_right = right_idx 
+                        elif (right_idx - last_valid_right) > gap_tolerance:
+                            break 
+                        right_idx += 1
+                    
+                    left_idx = idx
+                    last_valid_left = idx
+                    while left_idx >= 0:
+                        if den_nH_s[left_idx] >= envelope_thresh_nH:
+                            last_valid_left = left_idx
+                        elif (last_valid_left - left_idx) > gap_tolerance:
+                            break
+                        left_idx -= 1
+                    
+                    part_of_hcd_s[last_valid_left : last_valid_right + 1] = True
+
+                # 5. KERNEL BLEED CLEANUP (MULTIPLE SYSTEMS SAFE) — VECTORIZED
+                hcd_indices = np.where(part_of_hcd_s)[0]
+                if len(hcd_indices) > 0:
+                    jumps = np.where(np.diff(hcd_indices) > 1)[0]
+                    starts = np.insert(hcd_indices[jumps + 1], 0, hcd_indices[0])
+                    ends = np.append(hcd_indices[jumps], hcd_indices[-1])
+                    
+                    for s_idx, e_idx in zip(starts, ends):
+                        block_min = x_1d_s[s_idx]
+                        block_max = x_1d_s[e_idx]
+                        
+                        not_hcd_idx = np.where(~part_of_hcd_s)[0]
+                        if len(not_hcd_idx) == 0:
+                            continue
+                        
+                        p_x = x_1d_s[not_hcd_idx]
+                        p_hh = hh_s[not_hcd_idx]
+                        
+                        dist_to_min = np.abs(p_x - block_min)
+                        dist_to_min = np.where(dist_to_min > self.box / 2.0, self.box - dist_to_min, dist_to_min)
+                        dist_to_max = np.abs(p_x - block_max)
+                        dist_to_max = np.where(dist_to_max > self.box / 2.0, self.box - dist_to_max, dist_to_max)
+                        
+                        bleed_mask = ((dist_to_min <= p_hh) | (dist_to_max <= p_hh) | 
+                                      ((p_x >= block_min) & (p_x <= block_max)))
+                        part_of_hcd_s[not_hcd_idx[bleed_mask]] = True
+
+                part_of_hcd_structure = np.zeros(len(den_sk), dtype=bool)
+                part_of_hcd_structure[sort_idx] = part_of_hcd_s
+                
+                # 6. Mask Application
+                if self.filter_mode == "HCD_only": 
+                    mask_keep = part_of_hcd_structure
+                else:  # "Forest_only" (filter_mode validated in __init__)
+                    mask_keep = ~part_of_hcd_structure
+                
+                # # FALLBACK: if the HCD filter found no structure along this LOS,
+                # # interpolate ALL particles rather than returning zeros.
+                # if not np.any(mask_keep):
+                #     res_single = self._do_interpolation_work(
+                #         pos_sk, vel_sk, interp_den_sk, temp_sk, hh_sk,
+                #         amumass, line, get_tau,
+                #         custom_axis=single_axis, custom_cofm=single_cofm
+                #     )
+                #     final_interpolated_array[i_los, :] = res_single[0, :]
+                #     continue
+                if not np.any(mask_keep):  #Withouth the Fallback
+                    continue
+                    
+                pos_los = pos_sk[mask_keep]
+                hh_los = hh_sk[mask_keep]
+                interp_den_los = interp_den_sk[mask_keep]
+                
+                vel_los = vel_sk[mask_keep] if len(vel_sk) == len(mask_keep) else vel_sk
+                temp_los = temp_sk[mask_keep] if len(temp_sk) == len(mask_keep) else temp_sk
+
+                # Send ONLY the pre-filtered particles to C
+                res_single = self._do_interpolation_work(
+                    pos_los, vel_los, interp_den_los, temp_los, hh_los, amumass, line, get_tau, 
+                    custom_axis=single_axis, custom_cofm=single_cofm
+                )
+                
+                final_interpolated_array[i_los, :] = res_single[0, :]
+
+            return final_interpolated_array
+        # =====================================================================
+
+        # Standard fast execution for Mode = "None"
+        return self._do_interpolation_work(pos, vel, interp_den, temp, hh, amumass, line, get_tau)
+    
     def _read_particle_data(self, fn, elem, ion, get_tau):
-        """Read the particle data for a single interpolation"""
-        pos = self.snapshot_set.get_data(0, "Position", segment=fn).astype(np.float32)
-        hh = self.snapshot_set.get_smooth_length(0, segment=fn).astype(np.float32)
-
-        #Find particles we care about
-        if self.cofm_final:
+            """Read the particle data for a single interpolation"""
+            pos = self.snapshot_set.get_data(0, "Position", segment=fn).astype(np.float32)
+            
+            # ======================================================================
+            # NATIVE FIX FOR MN5/AREPO: MISSING SMOOTHING LENGTH
+            # ======================================================================
             try:
-                ind = self.part_ind[fn]
-            except KeyError:
+                hh = self.snapshot_set.get_smooth_length(0, segment=fn).astype(np.float32)
+                # MN5 often silently returns arrays of zeros instead of crashing. Catch it.
+                if np.max(hh) == 0.0:
+                    raise ValueError("Silent zero array detected")
+            except Exception:
+                # Reconstruct Volumetric Radius from Mass and Density: h = (3V / 4*pi)^(1/3)
+                try:
+                    mass = self.snapshot_set.get_data(0, "Masses", segment=fn).astype(np.float32)
+                except Exception:
+                    mass = self.snapshot_set.get_data(0, "Mass", segment=fn).astype(np.float32)
+                
+                rho = self.snapshot_set.get_data(0, "Density", segment=fn).astype(np.float32)
+                volume = mass / rho
+                #hh = (3.0 * volume / (4.0 * np.pi))**(1.0 / 3.0) corrected to:
+                hh = volume**(1.0 / 3.0)
+                hh = hh.astype(np.float32)
+            # ======================================================================
+
+            #Find particles we care about
+            if self.cofm_final:
+                try:
+                    ind = self.part_ind[fn]
+                except KeyError:
+                    ind = self.particles_near_lines(pos, hh, self.axis, self.cofm)
+                    self.part_ind[fn] = ind
+            else:
                 ind = self.particles_near_lines(pos, hh, self.axis, self.cofm)
-                self.part_ind[fn] = ind
-        else:
-            ind = self.particles_near_lines(pos, hh, self.axis, self.cofm)
-        #Do nothing if there aren't any, and return a suitably shaped zero array
-        if np.size(ind) == 0:
-            return (False, False, False, False, False, False)
-        pos = pos[ind, :]
-        hh = hh[ind]
-        #Get the rest of the arrays: reducing them each time to have a smaller memory footprint
-        vel = np.zeros(1, dtype=np.float32)
-        temp = np.zeros(1, dtype=np.float32)
-        if get_tau:
-            vel = self.snapshot_set.get_peculiar_velocity(0, segment=fn).astype(np.float32)
-            vel = vel[ind, :]
-        #gas density amu / cm^3
-        den = self.gasprop.get_code_rhoH(0, segment=fn).astype(np.float32)
-        # Get mass of atomic species
-        if elem != "Z":
-            amumass = self.lines.get_mass(elem)
-        else:
-            amumass = 1
-        den = den[ind]
-        #Only need temp for ionic density, and tau later
-        if get_tau or (ion != -1 and elem != 'H'):
-            temp = self.gasprop.get_temp(0, segment=fn).astype(np.float32)
-            temp = temp[ind]
-            #Some codes occasionally output negative temperatures, fix them
-            it = np.where(temp <= 0)
-            temp[it] = 1
-        #Find the mass fraction in this ion
-        #Get the mass fraction in this species: elem_den is now density in ionic species in amu/cm^3 kpc/h
-        #(these weird units are chosen to be correct when multiplied by the smoothing length)
-        elem_den = (den*self.rscale)*self.get_mass_frac(elem, fn, ind)
-        #Special case H1:
-        if elem == 'H' and ion == 1:
-            # Neutral hydrogen mass frac
-            elem_den *= (self.gasprop.get_reproc_HI(0, segment=fn)[ind]).astype(np.float32)
-        elif ion != -1:
-            #Cloudy density in physical H atoms / cm^3
-            ind2 = self._filter_particles(elem_den, pos, vel, den)
-            if np.size(ind2) == 0:
-                return (False, False, False, False, False, False)
-            #Shrink arrays: we don't want to interpolate particles
-            #with no mass in them
-            temp = temp[ind2]
-            pos = pos[ind2]
-            hh = hh[ind2]
+            #Do nothing if there aren't any, and return a suitably shaped zero array
+            if np.size(ind) == 0:
+                return (False, False, False, False, False, False, False)
+            pos = pos[ind, :]
+            hh = hh[ind]
+            #Get the rest of the arrays: reducing them each time to have a smaller memory footprint
+            vel = np.zeros(1, dtype=np.float32)
+            temp = np.zeros(1, dtype=np.float32)
             if get_tau:
-                vel = vel[ind2]
-            elem_den = elem_den[ind2] * self._get_elem_den(elem, ion, den[ind2], temp, ind, ind2)
-            del ind2
-        #Get rid of ind so we have some memory for the interpolator
-        del den
-        #Put density into number density of particles, from amu
-        elem_den /= amumass
-        #Do interpolation.
-        return (pos, vel, elem_den, temp, hh, amumass)
+                vel = self.snapshot_set.get_peculiar_velocity(0, segment=fn).astype(np.float32)
+                vel = vel[ind, :]
+            #gas density amu / cm^3
+            den = self.gasprop.get_code_rhoH(0, segment=fn).astype(np.float32)
+            # Get mass of atomic species
+            if elem != "Z":
+                amumass = self.lines.get_mass(elem)
+            else:
+                amumass = 1
+            den = den[ind]
+            #Only need temp for ionic density, and tau later
+            if get_tau or (ion != -1 and elem != 'H'):
+                temp = self.gasprop.get_temp(0, segment=fn).astype(np.float32)
+                temp = temp[ind]
+                #Some codes occasionally output negative temperatures, fix them
+                it = np.where(temp <= 0)
+                temp[it] = 1
+            #Find the mass fraction in this ion
+            elem_den = (den*self.rscale)*self.get_mass_frac(elem, fn, ind)
+            
+            # ======================================================================
+            # NATIVE FIX FOR MN5: DIRECT NEUTRAL FRACTION OVERRIDE
+            # ======================================================================
+            if elem == 'H' and ion == 1:
+                try:
+                    # Force direct read of the MN5 block to prevent recalculation errors
+                    nhi_frac = self.snapshot_set.get_data(0, "NeutralHydrogenAbundance", segment=fn).astype(np.float32)[ind]
+                except Exception:
+                    # Standard fallback
+                    nhi_frac = (self.gasprop.get_reproc_HI(0, segment=fn)[ind]).astype(np.float32)
+                
+                elem_den *= nhi_frac
+            # ======================================================================
+            
+            elif ion != -1:
+                ind2 = self._filter_particles(elem_den, pos, vel, den)
+                if np.size(ind2) == 0:
+                    return (False, False, False, False, False, False, False)
+                temp = temp[ind2]
+                pos = pos[ind2]
+                hh = hh[ind2]
+                if get_tau:
+                    vel = vel[ind2]
+                elem_den = elem_den[ind2] * self._get_elem_den(elem, ion, den[ind2], temp, ind, ind2)
+                den = den[ind2]
+                del ind2
+            #Put density into number density of particles, from amu
+            elem_den /= amumass
+            #Do interpolation. Return den as well for region growing.
+            return (pos, vel, elem_den, temp, hh, amumass, den)
 
     def find_all_particles(self):
         """Returns the positions, velocities and smoothing lengths of all particles near sightlines."""
@@ -615,7 +1004,7 @@ class Spectra:
         pp = np.empty([0, 3])
         hhh = np.array([])
         for i in range(nsegments):
-            (pos, _, _, _, hh, amumass) = self._read_particle_data(i, "H", -1, False)
+            (pos, _, _, _, hh, amumass, _) = self._read_particle_data(i, "H", -1, False)
             if amumass is not False:
                 pp = np.concatenate([pp, pos])
                 hhh = np.concatenate([hhh, hh])
@@ -656,11 +1045,23 @@ class Spectra:
             den2 = den
         return np.float32(self.cloudy_table.ion(elem, ion, den2, temp2))
 
-    def _do_interpolation_work(self, pos, vel, elem_den, temp, hh, amumass, line, get_tau):
-        """Run the interpolation on some pre-determined arrays, spat out by _read_particle_data"""
-        #Factor of 10^-8 converts line width (lambda_X) from Angstrom to cm
-        return _Particle_Interpolate(get_tau*1, self.nbins, self.kernel_int, self.box, self.velfac, self.atime, line.lambda_X*1e-8, line.gamma_X, line.fosc_X, amumass, self.tautail, pos, vel, elem_den, temp, hh, self.axis, self.cofm)
-
+    def _do_interpolation_work(self, pos, vel, elem_den, temp, hh, amumass, line, get_tau, custom_axis=None, custom_cofm=None):
+        """
+        Run the interpolation on some pre-determined arrays.
+        Now supports overriding the global axis and cofm for internal batch processing.
+        """
+        # Resolve which axis and cofm to use for this specific interpolation
+        run_axis = self.axis if custom_axis is None else custom_axis
+        run_cofm = self.cofm if custom_cofm is None else custom_cofm
+        
+        # Factor of 10^-8 converts line width (lambda_X) from Angstrom to cm
+        if self.turn_off_selfshield:
+            gamma_X = 0
+        else:
+            gamma_X = line.gamma_X
+            
+        return _Particle_Interpolate(get_tau*1, self.nbins, self.kernel_int, self.box, self.velfac, self.atime, line.lambda_X*1e-8, gamma_X, line.fosc_X, amumass, self.tautail, pos, vel, elem_den, temp, hh, run_axis, run_cofm)
+    
     def particles_near_lines(self, pos, hh, axis=None, cofm=None):
         """Filter a particle list, returning an index list of those near sightlines"""
         if axis is None:
@@ -699,11 +1100,12 @@ class Spectra:
         assert mass_frac.dtype == np.float32
         return mass_frac
 
-    def replace_not_DLA(self, ndla, thresh=10**20.3, elem="H", ion=1):
+    def replace_not_DLA(self, ndla, thresh=HCD_SELECTION_THRESH, elem="H", ion=1):
         """
         Replace those sightlines which do not contain sightlines above a given column density with new sightlines, until all sightlines are above the column density.
         Keep track of the number discarded in self.discarded.
-        Must implement get_cofm for this to work
+        Must implement get_cofm for this to work.
+        Default thresh is the HCD selection cut (10^17.2); pass 10**20.3 for DLAs only.
         """
         #Declare variables
         found = 0
@@ -747,9 +1149,11 @@ class Spectra:
         """Find a bunch more sightlines: should be overridden by child classes"""
         raise NotImplementedError
 
-    def filter_DLA(self, col_den, thresh=10**20.3):
-        """Find sightlines with a DLA"""
-        #DLAs are huge objects in redshift space (several 10s of A wide), so we want to
+    def filter_DLA(self, col_den, thresh=HCD_SELECTION_THRESH):
+        """Find sightlines whose integrated N_HI exceeds `thresh`.
+        Default is the HCD selection cut (10^17.2), matching this fork's target
+        population; pass 10**20.3 explicitly for the classic DLA definition."""
+        #HCDs are huge objects in redshift space (several 10s of A wide), so we want to
         #sum the column densities over the entire spectrum.
         cdsum = np.sum(col_den, axis=1)
         if np.size(thresh) > 1:
@@ -787,7 +1191,7 @@ class Spectra:
         hhs = np.sum(HH, axis=1)
         return mms/hhs/self.solar[species]
 
-    def compute_spectra(self, elem, ion, ll, get_tau):
+    def compute_spectra(self, elem, ion, ll, get_tau, weight=None):
         """
         Computes the absorption spectrum (tau (u) ) from a binned set of interpolated
         densities, velocities and temperatures.
@@ -797,17 +1201,29 @@ class Spectra:
         where V is the Voigt profile, b(x)^2 = 2k_B T /m_x c^2 is the velocity dispersion.
         and v_pec is the peculiar velocity.
         sigma_X is the cross-section for this transition.
+
+        weight=None: normal behaviour (tau or column density).
+        weight="temp": returns int(n_ion T dv)/pixel_length, the NUMERATOR of the
+        density-weighted temperature. Used by get_temp so the same HCD mask is
+        applied to numerator and denominator.
         """
         #Get array sizes
         nsegments = self.snapshot_set.get_n_segments(part_type=0)
         arepo = (self.kernel_int == 2)
-        if arepo :
-            nsegments=1
-        result = self._interpolate_single_file(0, elem, ion, ll, get_tau, load_all_data_first=arepo)
+        
+        # --- FORCE LOAD ALL DATA IF WE NEED GLOBAL MASKING ---
+        if hasattr(self, 'filter_mode') and self.filter_mode != "None":
+            load_all = True
+            nsegments_loop = 1
+        else:
+            load_all = arepo
+            nsegments_loop = 1 if arepo else nsegments
+            
+        result = self._interpolate_single_file(0, elem, ion, ll, get_tau, load_all_data_first=load_all, weight=weight)
         #Do remaining files
-        for nn in xrange(1, nsegments):
-            tresult = self._interpolate_single_file(nn, elem, ion, ll, get_tau)
-            print("Interpolation %.1f percent done" % (100*nn/nsegments), flush=True)
+        for nn in xrange(1, nsegments_loop):
+            tresult = self._interpolate_single_file(nn, elem, ion, ll, get_tau, weight=weight)
+            print(f"rank = {self.rank} | "+"Interpolation %.1f percent done" % (100*nn/nsegments_loop), flush=True)
             #Add new file
             result += tresult
             del tresult
@@ -836,7 +1252,6 @@ class Spectra:
     def eq_width_hist(self, elem, ion, line, dv=0.05):
         """
         Compute a histogram of the equivalent width distribution of our spectra.
-
         Returns:
             (v, f_table) - v (binned in log) and corresponding f(N)
         """
@@ -933,7 +1348,7 @@ class Spectra:
 
     def _vel_single_file(self, fn, elem, ion):
         """Get the column density weighted interpolated velocity field for a single file"""
-        (pos, vel, elem_den, temp, hh, amumass) = self._read_particle_data(fn, elem, ion, True)
+        (pos, vel, elem_den, temp, hh, amumass, _) = self._read_particle_data(fn, elem, ion, True)
         if amumass is False:
             return np.zeros([np.shape(self.cofm)[0], self.nbins, 3], dtype=np.float32)
         line = self.lines[("H", 1)][1215]
@@ -972,6 +1387,14 @@ class Spectra:
     def get_velocity(self, elem, ion):
         """Get the column density weighted velocity in each pixel for a given species.
         """
+        # The numerator path below reads particles UNFILTERED while the
+        # denominator (get_density) honours filter_mode -- a silent mismatch.
+        # Blocked until someone needs it; temperature got the proper fix.
+        if getattr(self, 'filter_mode', "None") != "None":
+            raise NotImplementedError(
+                "get_velocity is not filter-aware: its numerator would use all cells "
+                "while the denominator uses only the filtered ones. Build a second "
+                "Spectra with filter_mode='None' if you need the total field.")
         try:
             self._really_load_array((elem, ion), self.velocity, "velocity")
             return self.velocity[(elem, ion)]
@@ -982,7 +1405,7 @@ class Spectra:
 
     def _temp_single_file(self, fn, elem, ion):
         """Get the density weighted interpolated temperature field for a single file"""
-        (pos, vel, elem_den, temp, hh, amumass) = self._read_particle_data(fn, elem, ion, True)
+        (pos, vel, elem_den, temp, hh, amumass, _) = self._read_particle_data(fn, elem, ion, True)
         if amumass is False:
             return np.zeros([np.shape(self.cofm)[0], self.nbins], dtype=np.float32)
         line = self.lines[("H", 1)][1215]
@@ -991,22 +1414,35 @@ class Spectra:
         return temp
 
     def get_temp(self, elem, ion):
-        """Get the density weighted temperature in each pixel for a given species.
+        """Get the density weighted temperature in each pixel for a given species, in K.
+
+        FIX: this is now filter-aware. Under filter_mode != "None" the old path
+        computed the numerator from ALL cells but divided by the FILTERED column
+        density, inflating T by roughly colden_total/colden_filtered. Both
+        integrals now come from the same masked set of cells:
+            T(pixel) = int(n_ion T dv) / int(n_ion dv)
         """
         try:
             self._really_load_array((elem, ion), self.temp, "temperature")
             return self.temp[(elem, ion)]
         except KeyError:
-            temp = self._get_mass_weight_quantity(self._temp_single_file, elem, ion)
+            if getattr(self, 'filter_mode', "None") != "None":
+                # Numerator through the same filter machinery as tau/colden.
+                numer = self.compute_spectra(elem, ion, 1215, False, weight="temp")
+                den = self.get_density(elem, ion)
+                den = np.where(den == 0., 1., den)
+                temp = (numer / den).astype(np.float32)
+            else:
+                temp = self._get_mass_weight_quantity(self._temp_single_file, elem, ion)
             self.temp[(elem, ion)] = temp
             return temp
 
     def _densweightdens(self, fn, elem, ion):
         """Get the density weighted interpolated density field for a single file"""
-        (pos, vel, elem_den, temp, hh, amumass) = self._read_particle_data(fn, elem, ion, True)
+        (pos, vel, elem_den, temp, hh, amumass, _) = self._read_particle_data(fn, elem, ion, True)
         if amumass is False:
             return np.zeros([np.shape(self.cofm)[0], self.nbins], dtype=np.float32)
-        (_, _, species_den, _, _, _) = self._read_particle_data(fn, elem, -1, True)
+        (_, _, species_den, _, _, _, _) = self._read_particle_data(fn, elem, -1, True)
         line = self.lines[("H", 1)][1215]
         phys = np.float32(self.dvbin/self.velfac*self.rscale)
         dens = self._do_interpolation_work(pos, vel, (elem_den/phys)*(species_den/self.rscale), temp, hh, amumass, line, False)
@@ -1016,13 +1452,17 @@ class Spectra:
         """This function gets the (ion) density weighted (species) density in each pixel for a given species.
         This may seem an odd thing to compute, but it shows the characteristic density which dominates the
         production of a given ionic species is found in these spectra.
-
         For example, to see which gas densities produce the Lyman alpha forest, one could do:
             get_dens_weighted_density("H", 1)
         which would be:
             int ( rho_HI rho dv) / int(rho_HI dv)
         where rho is the density of hydrogen and rho_HI is the density of neutral hydrogen.
         """
+        # Same numerator/denominator mismatch as get_velocity under filtering.
+        if getattr(self, 'filter_mode', "None") != "None":
+            raise NotImplementedError(
+                "get_dens_weighted_density is not filter-aware. Build a second Spectra "
+                "with filter_mode='None' if you need it.")
         try:
             self._really_load_array((elem, ion), self.dens_weight_dens, "density_weight_density")
             return self.dens_weight_dens[(elem, ion)]
@@ -1068,7 +1508,6 @@ class Spectra:
         [N, N+dN] at the absorption distance X.
         The path can be either a whole sightline across the box, if line=True, or, if line=False,
         it can be a fixed spacing in the hubble flow.
-
         So we have f(N) = d n_abs/ dN dX
         and n_DLA(N) = number of absorbers per sightline in this column density bin.
                      1 sightline is defined to be one grid cell.
@@ -1076,7 +1515,6 @@ class Spectra:
         ie, f(N) = n_abs / ΔN / ΔX
         Note f(N) has dimensions of cm^2, because N has units of cm^-2 and X is dimensionless.
         Note column density is number of *ions* per cm^2, not amu per cm^2.
-
         Parameters:
             dlogN - bin spacing
             minN - minimum log N
@@ -1111,7 +1549,7 @@ class Spectra:
         tot_f_N = tot_f_N/(width*dist*tot_lines)
         return (center, tot_f_N)
 
-    def _rho_abs(self, thresh=10**20.3, upthresh=None, elem="H", ion=1):
+    def _rho_abs(self, thresh=HCD_SELECTION_THRESH, upthresh=None, elem="H", ion=1):
         """Compute rho_abs, the sum of the mass in an absorber,
            divided by the volume of the spectra in g/cm^3 (comoving).
             Omega_DLA = m_p * avg. column density / (1+z)^2 / length of column
@@ -1130,33 +1568,34 @@ class Spectra:
         #Avg density in g/cm^3 (comoving)
         return HIden/length
 
-    def rho_DLA(self, thresh=10**20.3):
-        """Compute rho_DLA, the average density in DLAs. This is almost the same as the average density in HI.
-           Units are 10^8 M_sun / Mpc^3 (comoving), like 0811.2003
-        """
+    def rho_DLA(self, thresh=HCD_SELECTION_THRESH):
+        """Compute the average density in absorbers above `thresh`. Almost the same as the average density in HI.
+           Units are 10^8 M_sun / Mpc^3 (comoving), like 0811.2003.
+           Default thresh is the HCD cut (10^17.2), so this is rho_HCD; pass
+           10**20.3 for the classic rho_DLA."""
         #Avg density in g/cm^3 (comoving)
         rho_DLA = self._rho_abs(thresh)
         # 1e8 M_sun/Mpc^3 in g/cm^3
         conv = 0.01 * self.units.UnitMass_in_g / self.units.UnitLength_in_cm**3
         return rho_DLA / conv
 
-    def omega_abs(self, thresh=10**20.3, upthresh=1e40, elem="H", ion=1):
+    def omega_abs(self, thresh=HCD_SELECTION_THRESH, upthresh=1e40, elem="H", ion=1):
         """Compute Omega_abs, the sum of the mass in a given absorber,
-            divided by the volume of the spectra, divided by the critical density.
-            Ω_abs = m_p * avg. column density / (1+z)^2 / length of column / rho_c
-            Note: If we want the neutral gas density rather than the neutral hydrogen density, divide by 0.76,
-            the hydrogen mass fraction.
+             divided by the volume of the spectra, divided by the critical density.
+             Ω_abs = m_p * avg. column density / (1+z)^2 / length of column / rho_c
+             Note: If we want the neutral gas density rather than the neutral hydrogen density, divide by 0.76,
+             the hydrogen mass fraction.
         """
         #Avg density in g/cm^3 (comoving) divided by critical density in g/cm^3
         omega_DLA = self._rho_abs(thresh, upthresh, elem=elem, ion=ion)/self.units.rho_crit(self.hubble)
         return omega_DLA
 
-    def omega_abs_cddf(self, thresh=10**20.3, upthresh=1e40, elem="H", ion=1):
+    def omega_abs_cddf(self, thresh=HCD_SELECTION_THRESH, upthresh=1e40, elem="H", ion=1):
         """Compute Omega_abs, the sum of the mass in a given absorber,
-            divided by the volume of the spectra, divided by the critical density.
-            Omega_abs = m_p * avg. column density / (1+z)^2 / length of column / rho_c
-            This is computed by summing the column density function, rather than directly by summing
-            columns. Should be the same as omega_abs.
+             divided by the volume of the spectra, divided by the critical density.
+             Omega_abs = m_p * avg. column density / (1+z)^2 / length of column / rho_c
+             This is computed by summing the column density function, rather than directly by summing
+             columns. Should be the same as omega_abs.
         """
         dlogN = 0.2
         (bins, cddf) = self.column_density_function(elem, ion, dlogN, minN=np.log10(thresh), maxN=np.log10(upthresh))
@@ -1168,11 +1607,13 @@ class Spectra:
         omega_abs = self.lines.get_mass(elem)*self.units.protonmass/self.units.light*h100/self.units.rho_crit(self.hubble)*np.trapz(moment, bins)
         return omega_abs
 
-    def line_density(self, thresh=10**20.3, upthresh=10**40, elem="H", ion=1):
-        """Compute the line density, the total no. of DLA sightlines divided by the total number of sightlines, multiplied by d L / dX. This is dN/dX = l_DLA(z)
+    def line_density(self, thresh=HCD_SELECTION_THRESH, upthresh=10**40, elem="H", ion=1):
+        """Compute the line density, the total no. of absorber sightlines divided by the total number of
+        sightlines, multiplied by d L / dX. Default thresh is the HCD cut (10^17.2), so this is
+        dN/dX = l_HCD(z); pass 10**20.3 for l_DLA(z).
         """
         col_den = np.sum(self.get_col_density(elem, ion), axis=1)
-        #Average fraction of pixels containing a DLA
+        #Average fraction of pixels containing an absorber
         frac = 1.*np.size(col_den[np.where((col_den > thresh)*(col_den < upthresh))])/np.size(col_den)
         #Divide by abs. distance per sightline
         frac *= np.size(col_den)/(np.size(col_den)+1.*self.discarded)
@@ -1210,7 +1651,6 @@ class Spectra:
         We find each DLA, identified using a maximum optical depth cut (tau_thresh).
         We then replace optically thick absorption around the DLA as long as the absorption is larger than
         mean optical depth + a secondary threshold, thresh2. The replaced absorption is set to the mean flux.
-
         Arguments: tt: optical depth array from a single spectrum.
         taueff: effective tau. The DLA will be replaced with constant absorption at this value.
         tau_thresh: optical depth threshold at which to enable filtering.
@@ -1289,14 +1729,34 @@ class Spectra:
         (kf, avg_flux_power) = fstat.flux_power(tau, self.vmax, spec_res=self.spec_res, mean_flux_desired=mean_flux_desired, window=window)
         return kf[1:], avg_flux_power[1:]
 
+    def get_flux_power_3D(self, comm_nbodykit=None, elem="H", ion=1, line=1215, mean_flux_desired=None, tau_thresh=None, dk=None, Nmu=10):
+        """Get the power spectrum of (variations in) the flux along the line of sight.
+        This is: P_F(k_F) = <d_F d_F>
+                 d_F = e^-tau / mean(e^-tau) - 1
+        Arguments:
+            comm_nbodykit: the MPI communicator to use for the nbodykit FFT, usually you don't need to set this.
+            elem: element to use for the optical depth
+            ion: ion to use for the optical depth, i.e. 1 for HI
+            line: line to use for the optical depth, i.e. 1215 for Lyman alpha
+            mean_flux_desired: if not None, the spectral optical depths will be rescaled
+                to match the desired mean flux.
+            tau_thresh: sightlines with a total optical depth greater than this value are removed before mean flux rescaling.
+            dk: the k bin width to use for the power spectrum, in h/cMpc units. If None, the default is used which is 2pi/boxsize.
+            Nmu: the number of mu bins to use for the power spectrum, the default 10 is what usually used for 3D correlation functions.
+            """
+        tau = self.get_tau(elem, ion, line)
+        #Remove sightlines which contain a strong absorber
+        tau = self._filter_tau(tau, tau_thresh=tau_thresh)
+        (k, mu, avg_flux_power) = fstat.flux_power_3d(comm_nbodykit, tau, self.box, mean_flux_desired, dk=dk, Nmu=Nmu, quiet=False)
+        # The fist row is the k=0, which we ommit
+        return k[1:,:], mu[1:,:], avg_flux_power[1:,:]
+
     def spline_fit(self, flux_i, chi_min=3., vel_seg_min=10., ini_break_spacing=50.):
         """
         Fit flux spectra (converge chi^2) using a cubic spline with adaptive breakpoints.
-
         chi_min = minimum change in chi^2 to accept a new breakpoint
         vel_seg_min = segment size limit (km/sec) i.e. resolution minimum
         ini_break_spacing = initial breakpoint spacing (km/sec)
-
         Returns: splines for each sightline (tau.shape)
         Note -- splines may return flux outside the 0 < F < 1 range
         """
@@ -1304,34 +1764,27 @@ class Spectra:
         def chi_squared(expected, observed):
         # observed is the fit, expected is the original spectrum
             return np.sum(((expected - observed)/np.std(expected))**2)
-
         # array of velocities (km/sec), i.e. x-axis
         vel = np.linspace(0, self.vmax, flux_i.shape[1])
         vel_stepsize = vel[1]-vel[0] # velocity bin size (km/sec)
         if vel_stepsize >= vel_seg_min:
             raise Exception("Velocity resolution must be less than minimum segment size (vel_stepsize < vel_seg_min)")
-
         # index spacing to get ~velocity breakpoint spacing
         ind_break_spacing = int(np.round(ini_break_spacing/vel_stepsize))
-
         all_spline_flux = np.zeros(flux_i.shape)
         for j in range(self.NumLos):
-
             flux = flux_i[j] # flux for current sight line
-
             # initial interior breakpoints
             interior_inds = np.arange(ind_break_spacing, vel.size, ind_break_spacing)
             # ensure the last segment is larger than vel_seg_min
             # 'segments' are the data between pairs of breakpoints
             if (vel[-1] - vel[interior_inds[-1]]) < vel_seg_min:
                 interior_inds = interior_inds[:-1]
-
             # initialize number of unconverged segments (to start while loop)
             n_unconverged = 1
             while n_unconverged > 0: # while there are unconverged segments
                 # fit the spline using the current step breakpoints
                 current_spline = LSQUnivariateSpline(vel, flux, vel[interior_inds], k=3, ext=3)
-
                 # indices for breakpoints, with start and end (interior + boundary points)
                 all_inds = np.concatenate([[0], interior_inds, [vel.size]])
                 # indices for breakpoints for maximal next step
@@ -1339,7 +1792,6 @@ class Spectra:
                 next_inds = np.sort(np.concatenate([all_inds, (all_inds[:-1] + all_inds[1:])//2]))[1:-1]
                 # fit the spline using the next step breakpoints, next_inds
                 next_spline = LSQUnivariateSpline(vel, flux, vel[next_inds], k=3, ext=3)
-
                 # initialize array to contain new breakpoints to be added
                 new_bp = np.empty(0, dtype=int)
                 for i in range(all_inds.size-1): # for each segment
@@ -1349,87 +1801,65 @@ class Spectra:
                     seg_flux = flux[all_inds[i]:all_inds[i+1]+1]
                     # current segment spline flux
                     seg_spline_flux = current_spline(seg_vel)
-
                     # chi squared for current spline versus input flux
                     chisq = chi_squared(seg_flux, seg_spline_flux)
                     # chisq for SAME segments, with added breakpoints
                     next_chisq = chi_squared(seg_flux, next_spline(seg_vel))
-
                     # segments sizes that would result from including proposed breakpoint
                     new_segs = np.array([seg_vel.max()-vel[next_inds[2*i]], vel[next_inds[2*i]]-seg_vel.min()])
                     # if chisq changes more than chi_min AND new segments > vel_seg_min
                     if (chisq-next_chisq) > chi_min and new_segs[0] >= vel_seg_min and new_segs[1] >= vel_seg_min:
                         # add a breakpoint ~halfway in the segment (nearest index)
                         new_bp = np.append(new_bp, int(np.round(all_inds[i]/2 + all_inds[i+1]/2)))
-
                 # number of segments that were improved with additional breakpoints
                 n_unconverged = new_bp.size
-
                 if n_unconverged > 0: # if there is at least 1 breakpoint to add
                     # add that breakpoint to the list of breakpoints and sort
                     interior_inds = np.sort(np.append(interior_inds, new_bp))
-
             # add current sight line spline to array of splines
             all_spline_flux[j] = current_spline(vel)
-
         return all_spline_flux
-
 
     def renormalize_flux(self, flux, section_size):
         """
         Renormalize flux into sections approximately section_size.
-
         flux = input flux, np.exp(-tau)
         section_size = desired section size
-
         Return: array of renormalized flux, arranged by section
         (i.e. the first section for all sight lines, then the 2nd section . . .)
         """
-
         # velocity step size (resolution, km/sec)
         vel_stepsize = self.vmax/(flux.shape[1]-1)
-
         if section_size < vel_stepsize/self.velfac or section_size > self.box:
             raise Exception("Section size must be greater than spatial resolution and <= box size.\n"+"Spatial resolution is "+str(vel_stepsize/self.velfac)+", box size is "+str(self.box))
-
         # number of (non-integer) sections that could fit into the box
         n_sections = self.box/section_size
         # number of indices for each section to get ~section_size
         n_inds = int(np.floor(self.vmax/(n_sections*vel_stepsize)))
-
         # initialize array for storing section flux
         # shape is [num_sight_lines * n_sections_per_sight_line, section length + 1]
         flux_sections = np.zeros([flux.shape[0]*int(np.floor(n_sections)), n_inds+1])
-
         # running counter for the flux_sections array index (where to store)
         fs_ind = 0
         for i in range(int(np.floor(n_sections))): # for each section
-
             for j in range(flux.shape[0]): # for each line of sight
-
                 # store the ith section flux into the flux_sections array
                 flux_sections[fs_ind] = flux[j, i*n_inds:(i+1)*n_inds+1]
                 # and divide by the maximum in the section
                 flux_sections[fs_ind] = flux_sections[fs_ind]/flux_sections[fs_ind].max()
                 fs_ind = fs_ind + 1
-
         return flux_sections
-
 
     def compute_curvature(self, flux):
         """
         Compute mean absolute curvatures for a set of flux spectra.
-
         Returns: the mean absolute curvature for each spectra passed.
         """
-
         # velocities, needed for more accurate derivatives
         vel = np.linspace(0, self.vmax, self.nbins)[0:flux.shape[1]]
         # initialize an array for the mean absolute curvatures
         curvature = np.zeros(flux.shape[0])
-
         for i in range(curvature.size): # for each section
-
             # limit flux to 0.1 < F < 0.9
             flux_range = np.where(np.logical_and(flux[i] > 0.1, flux[i] < 0.9))[0]
             # check that enough values actually fall in this range for a second derivative
@@ -1438,45 +1868,35 @@ class Spectra:
                 flux_p = np.gradient(flux[i, flux_range], vel[flux_range], edge_order=2)
                 # and get second derivative
                 flux_pp = np.gradient(flux_p, vel[flux_range], edge_order=2)
-
                 # compute the mean absolute curvature
                 curvature[i] = np.mean(np.abs(flux_pp/((1 + flux_p**2)**(3/2))))
-
         # ensure only sections with non-zero curvature are returned
         curvature = curvature[np.where(curvature > 0)]
-
         return curvature
-
 
     def get_curvature(self, elem, ion, line, section_size=0, snr_input=None, chi=3., seg_res=10., ini_break=50.):
         """
         Calculate the mean absolute curvature for a set of sight lines. Renormalizes each sight line spectra
         into sections of size section_size, then rescales them before computing the curvature.
-
         section_size = desired (spatial) size of spectra sections (spatial res <= section_size <= box size)
         snr_input = snr for the flux (array of size n_sightlines)
         chi = minimum chi^2 change to accept a new breakpoint in spline fitting
         seg_res = segment size limit (km/sec) i.e. resolution minimum for spline fitting
         ini_break = initial breakpoint spacing (km/sec) for spline fitting
-
         Returns: mean absolute curvature for each section of each sight line.
         """
-
         # check for noise in spectra, get spline fits accordingly
         # if no noise is requested, just return the flux
         if snr_input is None:
             flux = np.exp(-self.get_tau(elem, ion, line))
-
         # if a noise input is specified here, add that, then fit spline
         else:
             flux_i = self.add_noise(snr_input, np.exp(-self.get_tau(elem, ion, line)))[0]
             flux = self.spline_fit(flux_i, chi_min=chi, vel_seg_min=seg_res, ini_break_spacing=ini_break)
-
         if section_size == 0: # if no section size is passed, assume boxsize
             section_size = self.box
         # renormalize in section_size chunks (i.e. divide spectra and normalize)
         flux_sections = self.renormalize_flux(flux, section_size)
-
         # rescale the renormalized sections
         # tau should be nearly all the optical depths (minus where flux <= 0)
         tau = -np.log(flux_sections[np.where(flux_sections > 0)])
@@ -1485,8 +1905,6 @@ class Spectra:
         # scale the positive flux
         # non-positive flux will be removed in the call to compute_curvature
         flux_sections[np.where(flux_sections > 0)] = flux_sections[np.where(flux_sections > 0)]**scale
-
         # compute mean absolute curvature for each rescaled, renormalized section
         curvature = self.compute_curvature(flux_sections)
-
         return curvature
