@@ -140,28 +140,41 @@ class SingleAbsorber
          * btherm: thermal b parameter: sqrt(2kT/m)
          * vsmooth: smoothing length in velocity units (km/s)
          */
+        /* Integrand of the inner integral at one point vv of the kernel support,
+         * for the outer velocity vouter. Broken out of the loop below so that
+         * the trapezium rule can evaluate it at the two endpoints as well. */
+        inline double kern_term(const double vv, const double vouter)
+        {
+            const double q = sqrt(vdr2+vv*vv)/vsmooth;
+            //The difference between this velocity bin and the particle velocity
+            const double vdiff = vv - vouter;
+            const double T0 = vdiff/btherm;
+            double tbin = profile(T0, aa);
+            if(kernel == SPH_CUBIC_SPLINE)
+                tbin*=sph_cubic_kernel(q);
+            else if(kernel == SPH_QUINTIC_SPLINE)
+                tbin*=sph_quintic_kernel(q);
+            else if(kernel == TOP_HAT_KERNEL)
+                tbin *= 3./4./M_PI;
+            return tbin;
+        }
+
         inline double tau_kern_inner(const double vouter)
         {
             //Integration region goes from -vhigh to vhigh, where vhigh is precomputed kernel support
             const double deltav=2.*m_vhigh/NGRID;
-            //Because we are integrating over the whole sph kernel,
-            //the first and last terms will have q = 1, sph_kernel = 0, so don't need to compute them.
-            double total = 0;
+            // FIX: this is now a proper trapezium rule, matching tau_kern_outer.
+            // The old code summed only the NGRID-1 interior points and dropped
+            // both endpoints. For the SPH kernels that is harmless, because
+            // there q = 1 and the kernel vanishes at the endpoints. But the
+            // tophat and Voronoi kernels are NON-ZERO there, so the sum counted
+            // NGRID-1 intervals instead of NGRID and tau came out at exactly
+            // 7/8 of its correct value. colden was never affected: it uses the
+            // analytic *_kern_frac routines, not this quadrature.
+            double total = 0.5 * (kern_term(-m_vhigh, vouter) + kern_term(m_vhigh, vouter));
             for(int i=1; i<NGRID; ++i)
             {
-                const double vv = i*deltav-m_vhigh;
-                const double q = sqrt(vdr2+vv*vv)/vsmooth;
-                //The difference between this velocity bin and the particle velocity
-                const double vdiff = vv - vouter;
-                const double T0 = vdiff/btherm;
-                double tbin = profile(T0, aa);
-                if(kernel == SPH_CUBIC_SPLINE)
-                    tbin*=sph_cubic_kernel(q);
-                else if(kernel == SPH_QUINTIC_SPLINE)
-                    tbin*=sph_quintic_kernel(q);
-                else if(kernel == TOP_HAT_KERNEL)
-                    tbin *= 3./4./M_PI;
-                total+=tbin;
+                total += kern_term(i*deltav-m_vhigh, vouter);
             }
             return deltav*total;
         }
@@ -176,4 +189,3 @@ class SingleAbsorber
 
 double sph_cubic_kern_frac(double zlow, double zhigh, double smooth, double dr2, double zrange);
 #endif
-

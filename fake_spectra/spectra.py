@@ -42,6 +42,8 @@ from . import fluxstatistics as fstat
 from ._spectra_priv import _Particle_Interpolate, _near_lines
 from .cloudy_tables import convert_cloudy
 
+from scipy.ndimage import gaussian_filter1d
+
 def _get_cloudy_table(red, cdir=None):
     """Get the cloudy table if we didn't already"""
     #Generate cloudy tables
@@ -82,6 +84,15 @@ FILTER_MODES = ("None", "HCD_only", "Forest_only")
 #: normalised in Spectra.__init__ (and by the pipeline entry points).
 #: Pure aliasing -- no thresholds or logic differ between old and new names.
 LEGACY_FILTER_MODES = {"DLAs": "HCD_only", "No_DLAs": "Forest_only"}
+
+#: HCD decomposition algorithms.
+#:  "peaks"          -- Phase 1: velocity-space peak decomposition (default).
+#:  "peaks+blend"    -- Phase 1 + the flux blending test (Phase 2).
+#:  "region_growing" -- the old real-space region growing, kept for comparison.
+HCD_ALGORITHMS = ("peaks", "peaks+blend", "region_growing")
+
+#: Gauss-Legendre nodes for the per-cell column of the SPH kernels.
+_GL_X, _GL_W = np.polynomial.legendre.leggauss(16)
 
 class Spectra:
     """Class to interpolate particle densities along a line of sight and calculate their absorption
@@ -129,12 +140,24 @@ class Spectra:
                       only cores within +- halo_radius_cut * R200 of the halo
                       centre (along the LOS axis) are accepted.
             halo_radius_cut - window half-width in units of R200 (default 5).
+            gap_tolerance_length - how long a hole inside a growing HCD may be
+                      before the growth stops, in SIMULATION LENGTH UNITS.
+                      "auto" (default) uses the Schaye 2001 Jeans length at the
+                      seed density, 1.6e21/sqrt(n_H_seed) cm. Replaces the old
+                      cell-COUNT tolerance, which was not a physical quantity:
+                      Arepo cells scale as rho^(-1/3), so a fixed number of
+                      cells meant ~10 kpc/h inside a DLA core but ~1 Mpc/h in
+                      the diffuse IGM, and LLS sightlines merged several
+                      independent absorbers into one.
     """
     def __init__(self, num, base, cofm, axis, MPI=None, nbins=None, res=1., cdir=None, savefile="spectra.hdf5",
              savedir=None, reload_file=False, spec_res = 0,load_halo=False, units=None, sf_neutral=True, turn_off_selfshield=False,
              quiet=False, load_snapshot=True, gasprop=None, gasprop_args=None, kernel=None, use_external_Hz=None,
              filter_mode="None", hcd_phys_thresh="auto",
-             halo_r200=None, halo_radius_cut=5.0):
+             halo_r200=None, halo_radius_cut=5.0, gap_tolerance_length=0.0,
+             hcd_algorithm="peaks+blend", hcd_peak_smooth_kms="auto",
+             hcd_peak_contrast=0.5, hcd_blend_flux_thresh=0.1,
+             hcd_envelope_frac=0.01):
         
         #Present for compatibility. Functionality moved to HaloAssignedSpectra
         _= load_halo
@@ -164,6 +187,11 @@ class Spectra:
         if MPI is not None and filter_mode != "None":
             raise ValueError("filter_mode != 'None' requires MPI=None (the HCD filter "
                              "loads the whole snapshot on one rank).")
+        if hcd_algorithm not in HCD_ALGORITHMS:
+            raise ValueError("hcd_algorithm must be one of %s, got %r"
+                             % (HCD_ALGORITHMS, hcd_algorithm))
+        self.hcd_algorithm = hcd_algorithm
+ 
 
         #Create the unit system
         if units is not None:
@@ -183,6 +211,18 @@ class Spectra:
         self.dens_weight_dens = {}
         #A cache of the indices of particles near sightlines.
         self.part_ind = {}
+        # PERF caches, used only when filter_mode != "None".
+        # tau, colden and the temperature numerator are three separate passes
+        # over the SAME particles and produce the SAME HCD mask; profiling a
+        # 36-skewer halo showed _read_particle_data taking 295.8 s out of
+        # 296.6 s total, across 384 calls = 128 snapshot chunks x 3 passes.
+        # These two dicts let passes 2 and 3 skip the disk and the region
+        # growing entirely. They do NOT raise peak memory: the arrays already
+        # had to be resident during the first pass.
+        # Both are keyed on (segment, elem, ion) and are only valid while cofm
+        # and axis are unchanged -- call clear_caches() if you mutate either.
+        self._particle_cache = {}
+        self._hcd_mask_cache = {}
         #This variable should be set to true once the sightlines are fixed, and the cache can be used.
         self.cofm_final = False
         self.num_important = {}
@@ -342,41 +382,65 @@ class Spectra:
         #self.hcd_mask_radius = hcd_mask_radius
         
         if self.filter_mode != "None":
-            if hcd_phys_thresh == "auto":
-                from scipy.optimize import root_scalar
-                
-                # Solve for n_H because the Jeans length approximation requires total density.
-                def target_function(log_nH):
-                    nH = 10**log_nH
-                    f_HI = self.gasprop._neutral_fraction(nH, 1e4)
-                    N_H = 1.6e21 * np.sqrt(nH)
-                    N_HI = f_HI * N_H
-                    # SEED at 10^16.5: smaller than the 10^17.2 HCD definition on
-                    # purpose. The Schaye 2001 approximation is not exact and we
-                    # want a safety margin so no genuine HCD particle is missed;
-                    # the strict 17.2 cut is applied later to the integrated
-                    # sightline N_HI (see utils.SpectrumEngine).
-                    return np.log10(N_HI) - HCD_SEED_LOGNHI
-                
-                res = root_scalar(target_function, bracket=[-5.0, 2.0], method='brentq')
-                self.hcd_phys_thresh_nH = 10**res.root
-                
-                # Map the n_H threshold to its corresponding n_HI threshold at T=10^4K.
-                f_HI_thresh = self.gasprop._neutral_fraction(self.hcd_phys_thresh_nH, 1e4)
-                self.hcd_phys_thresh_nHI = self.hcd_phys_thresh_nH * f_HI_thresh
-                
-                if not quiet:
-                    # FIX: this print used to claim 10^17.2 while the solver
-                    # targeted 16.5. Now it tells the truth.
-                    print(f"Auto HCD SEED threshold for z={self.red:.2f} (log10 N_HI = {HCD_SEED_LOGNHI}; "
-                          f"safety margin below the {HCD_SELECTION_LOGNHI} selection cut):", flush=True)
-                    print(f" -> Total Hydrogen trigger (nH): {self.hcd_phys_thresh_nH:.5e} atoms/cm^3", flush=True)
-                    print(f" -> Neutral Hydrogen trigger (nHI): {self.hcd_phys_thresh_nHI:.5e} atoms/cm^3", flush=True)
-            else:
-                self.hcd_phys_thresh_nH = float(hcd_phys_thresh)
-                f_HI_thresh = self.gasprop._neutral_fraction(self.hcd_phys_thresh_nH, 1e4)
-                self.hcd_phys_thresh_nHI = self.hcd_phys_thresh_nH * f_HI_thresh
+            # The Voronoi kernel rebuilds its cell segments from whatever
+            # particles it is given, so handing it a filtered subset silently
+            # redistributes the removed cells' volume onto the survivors and
+            # the HCD and forest channels stop summing to the total.
+            if self.kernel_int == 2:
+                raise ValueError("filter_mode is incompatible with kernel='voronoi'. "
+                                 "Use kernel='tophat' for Arepo.")
 
+            self.hcd_selection_thresh = HCD_SELECTION_THRESH
+            self.hcd_peak_contrast = float(hcd_peak_contrast)
+            self.hcd_blend_flux_thresh = float(hcd_blend_flux_thresh)
+            self.hcd_basin_info = {}
+
+            # Smoothing scale for the peak finder. Not a free knob: it is the
+            # width below which no line-fitting pipeline could separate two
+            # components, i.e. thermal broadening of the gas, added in
+            # quadrature with the pixel and the spectrograph response.
+            if hcd_peak_smooth_kms == "auto":
+                b_th = np.sqrt(2*1.3806504e-16/1.6726e-24)/1e5*np.sqrt(1e4)
+                self.hcd_peak_smooth_kms = float(np.sqrt(
+                    (b_th/np.sqrt(2.))**2 + self.dvbin**2/12. + self.spec_res**2))
+            else:
+                self.hcd_peak_smooth_kms = float(hcd_peak_smooth_kms)
+
+            # -- density thresholds: used ONLY by the legacy region growing --
+            self.hcd_envelope_frac = float(hcd_envelope_frac)
+            if self.hcd_algorithm == "region_growing":
+                if hcd_phys_thresh == "auto":
+                    from scipy.optimize import root_scalar
+                    def target_function(log_nH):
+                        nH = 10**log_nH
+                        f_HI = self.gasprop._neutral_fraction(nH, 1e4)
+                        return np.log10(f_HI*1.6e21*np.sqrt(nH)) - HCD_SEED_LOGNHI
+                    res = root_scalar(target_function, bracket=[-5.0, 2.0], method='brentq')
+                    self.hcd_phys_thresh_nH = 10**res.root
+                else:
+                    self.hcd_phys_thresh_nH = float(hcd_phys_thresh)
+                f_HI_thresh = self.gasprop._neutral_fraction(self.hcd_phys_thresh_nH, 1e4)
+                self.hcd_phys_thresh_nHI = self.hcd_phys_thresh_nH*f_HI_thresh
+                self.hcd_envelope_thresh = self.hcd_phys_thresh_nH*self.hcd_envelope_frac
+                if gap_tolerance_length == "auto":
+                    self.gap_tolerance_length = float(
+                        (1.6e21/np.sqrt(self.hcd_phys_thresh_nH))/self.rscale)
+                else:
+                    self.gap_tolerance_length = float(gap_tolerance_length)
+
+            if not quiet:
+                print(f"HCD decomposition: algorithm={self.hcd_algorithm}", flush=True)
+                if self.hcd_algorithm != "region_growing":
+                    print(f" -> selection cut      : log10 N_HI = {HCD_SELECTION_LOGNHI}", flush=True)
+                    print(f" -> peak smoothing     : {self.hcd_peak_smooth_kms:.2f} km/s", flush=True)
+                    print(f" -> peak contrast      : {self.hcd_peak_contrast}", flush=True)
+                    if self.hcd_algorithm == "peaks+blend":
+                        print(f" -> blend flux thresh  : {self.hcd_blend_flux_thresh}", flush=True)
+                else:
+                    print(f" -> seed nH={self.hcd_phys_thresh_nH:.4e}, "
+                          f"envelope frac={self.hcd_envelope_frac}, "
+                          f"gap={self.gap_tolerance_length:.4g}", flush=True)
+                    
         # =====================================================================
         # HALO-CENTRIC LOCALIZATION FOR HCD CORE SELECTION
         # =====================================================================
@@ -444,11 +508,19 @@ class Spectra:
         # HCD provenance
         grp.attrs["filter_mode"] = str(self.filter_mode)
         if self.filter_mode != "None":
-            grp.attrs["hcd_seed_lognhi"] = HCD_SEED_LOGNHI
-            grp.attrs["hcd_thresh_nH"] = self.hcd_phys_thresh_nH
-            grp.attrs["hcd_thresh_nHI"] = self.hcd_phys_thresh_nHI
+            grp.attrs["hcd_algorithm"] = str(self.hcd_algorithm)
+            grp.attrs["hcd_selection_lognhi"] = HCD_SELECTION_LOGNHI
+            grp.attrs["hcd_peak_smooth_kms"] = self.hcd_peak_smooth_kms
+            grp.attrs["hcd_peak_contrast"] = self.hcd_peak_contrast
+            grp.attrs["hcd_blend_flux_thresh"] = self.hcd_blend_flux_thresh
             grp.attrs["halo_radius_cut"] = self.halo_radius_cut
             grp.attrs["halo_r200"] = -1.0 if self.halo_r200 is None else float(self.halo_r200)
+            if self.hcd_algorithm == "region_growing":
+                grp.attrs["hcd_seed_lognhi"] = HCD_SEED_LOGNHI
+                grp.attrs["hcd_thresh_nH"] = self.hcd_phys_thresh_nH
+                grp.attrs["hcd_thresh_nHI"] = self.hcd_phys_thresh_nHI
+                grp.attrs["hcd_envelope_frac"] = self.hcd_envelope_frac
+                grp.attrs["hcd_gap_tolerance_length"] = self.gap_tolerance_length
         grp = f.create_group("spectra")
         grp["cofm"] = self.cofm
         grp["axis"] = self.axis
@@ -655,32 +727,57 @@ class Spectra:
         if weight is not None:
             assert not get_tau, "weighted interpolation is a get_tau=False quantity"
         # Temperature must be loaded (and pooled) even though get_tau is False.
-        read_tau = get_tau or (weight == "temp")
-        
+
         # --- GLOBAL SKEWER AWARENESS FOR TOPOLOGICAL FILTERING ---
-        if hasattr(self, 'filter_mode') and self.filter_mode != "None":
+        filtering = hasattr(self, 'filter_mode') and self.filter_mode != "None"
+        if filtering:
             load_all_data_first = True
-            
-        (pos, vel, elem_den, temp, hh, amumass, den) = self._read_particle_data(nsegment, elem, ion, read_tau)
-        
-        if load_all_data_first:
-            for nseg in range(1, self.snapshot_set.get_n_segments()):
-                (pos_, vel_, elem_den_, temp_, hh_, amumass_, den_) = self._read_particle_data(nseg, elem, ion, read_tau)
-                if amumass_ is False:
-                    continue
-                if amumass is False:
-                    pos, vel, temp, elem_den, hh, den = pos_, vel_, temp_, elem_den_, hh_, den_
-                else:
-                    pos = np.concatenate((pos, pos_), axis=0)
-                    if read_tau:
-                        vel = np.concatenate((vel, vel_), axis=0)
-                    elem_den = np.append(elem_den, elem_den_)
-                    if read_tau or (ion != -1 and elem != 'H'):
-                        temp = np.append(temp, temp_)
-                    hh = np.append(hh, hh_)
-                    den = np.append(den, den_)
-                amumass = amumass_
-                
+
+        # The HCD decomposition works in redshift space, so the peculiar
+        # velocities are needed even for the colden and temperature passes:
+        # without them the three products would not share the same mask.
+        read_tau = get_tau or (weight == "temp") or filtering
+
+        # PERF: read the particles once and reuse them for every product.
+        # get_tau, get_col_density and get_temp each call this function with
+        # the same (nsegment, elem, ion); only `interp_den` and `get_tau`
+        # differ afterwards, and neither changes what has to be read. An entry
+        # taken with read_tau=True is a superset, so a later read_tau=False
+        # pass can use it as is. Only active under filtering, so the stock
+        # code path keeps its original memory profile exactly.
+        cache_key = (nsegment, elem, ion)
+        entry = self._particle_cache.get(cache_key) if filtering else None
+        if entry is not None and (entry['has_tau'] or not read_tau):
+            (pos, vel, elem_den, temp, hh, amumass, den) = entry['data']
+        else:
+            (pos, vel, elem_den, temp, hh, amumass, den) = self._read_particle_data(nsegment, elem, ion, read_tau)
+
+            if load_all_data_first:
+                for nseg in range(1, self.snapshot_set.get_n_segments()):
+                    (pos_, vel_, elem_den_, temp_, hh_, amumass_, den_) = self._read_particle_data(nseg, elem, ion, read_tau)
+                    if amumass_ is False:
+                        continue
+                    if amumass is False:
+                        pos, vel, temp, elem_den, hh, den = pos_, vel_, temp_, elem_den_, hh_, den_
+                    else:
+                        pos = np.concatenate((pos, pos_), axis=0)
+                        if read_tau:
+                            vel = np.concatenate((vel, vel_), axis=0)
+                        elem_den = np.append(elem_den, elem_den_)
+                        if read_tau or (ion != -1 and elem != 'H'):
+                            temp = np.append(temp, temp_)
+                        hh = np.append(hh, hh_)
+                        den = np.append(den, den_)
+                    amumass = amumass_
+
+            if filtering:
+                # A richer entry (has_tau=True) replaces a poorer one, so the
+                # order in which the products are requested does not matter.
+                self._particle_cache[cache_key] = {
+                    'data': (pos, vel, elem_den, temp, hh, amumass, den),
+                    'has_tau': bool(read_tau)}
+                # The mask depends on the particles, so a re-read invalidates it.
+                self._hcd_mask_cache.pop(cache_key, None)
         if amumass is False:
             return np.zeros([np.shape(self.cofm)[0], self.nbins], dtype=np.float32)
 
@@ -710,21 +807,48 @@ class Spectra:
         # HYBRID 1D REGION GROWING FILTERING (KERNEL AWARE) - BATCH IN RAM
         # =====================================================================
         if hasattr(self, 'filter_mode') and self.filter_mode != "None":
-            
-            core_thresh_nHI = self.hcd_phys_thresh_nHI
-            envelope_thresh_nH = getattr(self, 'hcd_envelope_thresh',
-                                         getattr(self, 'dla_envelope_thresh',
-                                                 self.hcd_phys_thresh_nH * 0.01))
-            gap_tolerance = getattr(self, 'gap_tolerance', 10)
 
             # Pre-allocate the master array for all skewers
             final_interpolated_array = np.zeros([self.NumLos, self.nbins], dtype=np.float32)
+            # Pre-allocate the master array for all skewers
+            final_interpolated_array = np.zeros([self.NumLos, self.nbins], dtype=np.float32)
+
+            # PERF: the HCD mask is a function of pos, hh, elem_den and den
+            # alone -- none of which differ between the tau, colden and
+            # temperature passes. Without this cache the per-skewer
+            # particles_near_lines call, the argsort, the attenuation, the
+            # region growing and the kernel-bleed cleanup all ran three times
+            # over to produce three identical answers. We store the FINAL
+            # particle indices per sightline, so a cached pass reduces to
+            # slicing the arrays and calling the interpolator.
+            mask_list = self._hcd_mask_cache.get(cache_key)
+            mask_is_cached = mask_list is not None
+            if not mask_is_cached:
+                mask_list = [None] * self.NumLos
+                self._hcd_mask_cache[cache_key] = mask_list
 
             # --- PROCESS EACH SKEWER FROM LOADED RAM DATA ---
             for i_los in range(self.NumLos):
                 
                 single_axis = np.array([self.axis[i_los]], dtype=np.int32)
                 single_cofm = np.array([self.cofm[i_los]], dtype=np.float64)
+
+                # PERF fast path: this sightline was already resolved by an
+                # earlier product. An empty entry is a real cached answer
+                # ("nothing kept"), not a cache miss -- hence the flag rather
+                # than a None test on the entry itself.
+                if mask_is_cached:
+                    ind_final = mask_list[i_los]
+                    if ind_final is None or len(ind_final) == 0:
+                        continue
+                    vel_los = vel[ind_final] if len(vel) == len(pos) else vel
+                    temp_los = temp[ind_final] if len(temp) == len(pos) else temp
+                    res_single = self._do_interpolation_work(
+                        pos[ind_final], vel_los, interp_den[ind_final], temp_los,
+                        hh[ind_final], amumass, line, get_tau,
+                        custom_axis=single_axis, custom_cofm=single_cofm)
+                    final_interpolated_array[i_los, :] = res_single[0, :]
+                    continue
                 
                 # 1. EXTRACT PARTICLES EXACTLY AS OLD METHOD DID (Bit-for-bit parity)
                 # Usamos a rotina nativa em C para garantir que as partículas sejam
@@ -732,6 +856,8 @@ class Spectra:
                 ind_sk = self.particles_near_lines(pos, hh, single_axis, single_cofm)
                 
                 if len(ind_sk) == 0:
+                    # PERF: cache the empty verdict too (see the fast path above).
+                    mask_list[i_los] = np.empty(0, dtype=np.intp)
                     continue
                     
                 pos_sk = pos[ind_sk]
@@ -743,131 +869,90 @@ class Spectra:
                 vel_sk = vel[ind_sk] if len(vel) == len(pos) else vel
                 temp_sk = temp[ind_sk] if len(temp) == len(pos) else temp
                 
-                # 2. CALCULATE PERPENDICULAR DISTANCE AND ATTENUATION
-                ax_idx = self.axis[i_los] - 1  
+                # 2. PERPENDICULAR DISTANCE (needed by both algorithms)
+                ax_idx = self.axis[i_los] - 1
                 idx_other = [0, 1, 2]
                 idx_other.remove(ax_idx)
-                
                 dy = np.abs(pos_sk[:, idx_other[0]] - single_cofm[0, idx_other[0]])
-                dy = np.where(dy > self.box / 2.0, self.box - dy, dy) # PBC
+                dy = np.where(dy > self.box/2.0, self.box - dy, dy)
                 dz = np.abs(pos_sk[:, idx_other[1]] - single_cofm[0, idx_other[1]])
-                dz = np.where(dz > self.box / 2.0, self.box - dz, dz) # PBC
-                
+                dz = np.where(dz > self.box/2.0, self.box - dz, dz)
                 d_perp_sk = np.sqrt(dy**2 + dz**2)
-                
-                x_1d = pos_sk[:, ax_idx]
-                sort_idx = np.argsort(x_1d)
-                x_1d_s = x_1d[sort_idx] # Sorted physical coordinates
-                
-                q = d_perp_sk / hh_sk
-                w_attenuation = np.zeros_like(q)
-                
-                if self.kernel_int == 1:
-                    mask1 = q <= 0.5
-                    mask2 = (q > 0.5) & (q <= 1.0)
-                    w_attenuation[mask1] = 1.0 - 6.0 * q[mask1]**2 + 6.0 * q[mask1]**3
-                    w_attenuation[mask2] = 2.0 * (1.0 - q[mask2])**3
-                else:
-                    mask_intersect = q <= 1.0
-                    w_attenuation[mask_intersect] = np.sqrt(1.0 - q[mask_intersect]**2)
 
-                nH_phys_intrinsic = den_sk * 0.76
-                nHI_phys_intrinsic = (elem_den_sk / self.rscale) * amumass
-                
-                nH_eff_skewer = nH_phys_intrinsic * w_attenuation
-                nHI_eff_skewer = nHI_phys_intrinsic * w_attenuation
-                
-                den_nH_s = nH_eff_skewer[sort_idx] 
-                den_nHI_s = nHI_eff_skewer[sort_idx] 
-                hh_s = hh_sk[sort_idx]
-                
-                part_of_hcd_s = np.zeros(len(den_nH_s), dtype=bool)
-                
-                # 3. Find the Cores (SEED threshold, see HCD_SEED_LOGNHI)
-                core_indices = np.where(den_nHI_s >= core_thresh_nHI)[0]
-                
-                # 3b. HALO-CENTRIC CORE FILTERING
-                # Only keep cores within ±N*R200 of the sightline center along the LOS axis.
-                # This guarantees that secondary HCDs intersected by chance along the
-                # line of sight are NOT classified as belonging to the target halo.
-                # (The sightline center along the LOS axis == the halo centre,
-                #  by construction of cofm in radii_skewers.)
-                if (self.halo_r200 is not None) and (len(core_indices) > 0):
-                    # Sightline center coordinate along the LOS axis (sim units)
-                    los_center = single_cofm[0, ax_idx]
-                    
-                    # Physical positions of the candidate cores along the LOS axis
-                    core_positions = x_1d_s[core_indices]
-                    
-                    # Periodic distance from sightline center
-                    d_core = np.abs(core_positions - los_center)
-                    d_core = np.where(d_core > self.box / 2.0, self.box - d_core, d_core)
-                    
-                    # Acceptance window
-                    window = self.halo_radius_cut * self.halo_r200
-                    
-                    keep_core_mask = d_core <= window
-                    core_indices = core_indices[keep_core_mask]
-                
-                # 4. Region Growing (only from accepted cores)
-                for idx in core_indices:
-                    if part_of_hcd_s[idx]: continue 
-                        
-                    right_idx = idx
-                    last_valid_right = idx
-                    while right_idx < len(den_nH_s):
-                        if den_nH_s[right_idx] >= envelope_thresh_nH:
-                            last_valid_right = right_idx 
-                        elif (right_idx - last_valid_right) > gap_tolerance:
-                            break 
-                        right_idx += 1
-                    
-                    left_idx = idx
-                    last_valid_left = idx
-                    while left_idx >= 0:
-                        if den_nH_s[left_idx] >= envelope_thresh_nH:
-                            last_valid_left = left_idx
-                        elif (last_valid_left - left_idx) > gap_tolerance:
-                            break
-                        left_idx -= 1
-                    
-                    part_of_hcd_s[last_valid_left : last_valid_right + 1] = True
-
-                # 5. KERNEL BLEED CLEANUP (MULTIPLE SYSTEMS SAFE) — VECTORIZED
-                hcd_indices = np.where(part_of_hcd_s)[0]
-                if len(hcd_indices) > 0:
-                    jumps = np.where(np.diff(hcd_indices) > 1)[0]
-                    starts = np.insert(hcd_indices[jumps + 1], 0, hcd_indices[0])
-                    ends = np.append(hcd_indices[jumps], hcd_indices[-1])
-                    
-                    for s_idx, e_idx in zip(starts, ends):
-                        block_min = x_1d_s[s_idx]
-                        block_max = x_1d_s[e_idx]
-                        
-                        not_hcd_idx = np.where(~part_of_hcd_s)[0]
-                        if len(not_hcd_idx) == 0:
+                if self.hcd_algorithm == "region_growing":
+                    # ---- LEGACY real-space path, kept only for comparison ----
+                    x_1d = pos_sk[:, ax_idx]
+                    sort_idx = np.argsort(x_1d)
+                    x_1d_s = x_1d[sort_idx]
+                    q = d_perp_sk/hh_sk
+                    w_attenuation = np.zeros_like(q)
+                    if self.kernel_int == 1:
+                        m1 = q <= 0.5
+                        m2 = (q > 0.5) & (q <= 1.0)
+                        w_attenuation[m1] = 1.0 - 6.0*q[m1]**2 + 6.0*q[m1]**3
+                        w_attenuation[m2] = 2.0*(1.0 - q[m2])**3
+                    else:
+                        w_attenuation[q <= 1.0] = np.sqrt(1.0 - q[q <= 1.0]**2)
+                    nH_phys_intrinsic = den_sk*0.76
+                    nHI_phys_intrinsic = (elem_den_sk/self.rscale)*amumass
+                    den_nH_s = (nH_phys_intrinsic*w_attenuation)[sort_idx]
+                    den_nHI_s = (nHI_phys_intrinsic*w_attenuation)[sort_idx]
+                    hh_s = hh_sk[sort_idx]
+                    d_perp_s = d_perp_sk[sort_idx]
+                    part_of_hcd_s = np.zeros(len(den_nH_s), dtype=bool)
+                    core_indices = np.where(den_nHI_s >= self.hcd_phys_thresh_nHI)[0]
+                    if (self.halo_r200 is not None) and (len(core_indices) > 0):
+                        los_center = single_cofm[0, ax_idx]
+                        d_core = np.abs(x_1d_s[core_indices] - los_center)
+                        d_core = np.where(d_core > self.box/2.0, self.box - d_core, d_core)
+                        core_indices = core_indices[d_core <= self.halo_radius_cut*self.halo_r200]
+                    envelope_thresh_nH = self.hcd_envelope_thresh
+                    gap_len = self.gap_tolerance_length
+                    for idx in core_indices:
+                        if part_of_hcd_s[idx]:
                             continue
-                        
-                        p_x = x_1d_s[not_hcd_idx]
-                        p_hh = hh_s[not_hcd_idx]
-                        
-                        dist_to_min = np.abs(p_x - block_min)
-                        dist_to_min = np.where(dist_to_min > self.box / 2.0, self.box - dist_to_min, dist_to_min)
-                        dist_to_max = np.abs(p_x - block_max)
-                        dist_to_max = np.where(dist_to_max > self.box / 2.0, self.box - dist_to_max, dist_to_max)
-                        
-                        bleed_mask = ((dist_to_min <= p_hh) | (dist_to_max <= p_hh) | 
-                                      ((p_x >= block_min) & (p_x <= block_max)))
-                        part_of_hcd_s[not_hcd_idx[bleed_mask]] = True
+                        r_i, lvr = idx, idx
+                        while r_i < len(den_nH_s):
+                            if den_nH_s[r_i] >= envelope_thresh_nH:
+                                lvr = r_i
+                            elif (x_1d_s[r_i] - x_1d_s[lvr]) > gap_len:
+                                break
+                            r_i += 1
+                        l_i, lvl = idx, idx
+                        while l_i >= 0:
+                            if den_nH_s[l_i] >= envelope_thresh_nH:
+                                lvl = l_i
+                            elif (x_1d_s[lvl] - x_1d_s[l_i]) > gap_len:
+                                break
+                            l_i -= 1
+                        part_of_hcd_s[lvl:lvr+1] = True
+                    hcd_indices = np.where(part_of_hcd_s)[0]
+                    if len(hcd_indices) > 0:
+                        jumps = np.where(np.diff(hcd_indices) > 1)[0]
+                        starts = np.insert(hcd_indices[jumps+1], 0, hcd_indices[0])
+                        ends = np.append(hcd_indices[jumps], hcd_indices[-1])
+                        for s_idx, e_idx in zip(starts, ends):
+                            bmin, bmax = x_1d_s[s_idx], x_1d_s[e_idx]
+                            nh = np.where(~part_of_hcd_s)[0]
+                            if len(nh) == 0:
+                                continue
+                            p_x = x_1d_s[nh]
+                            p_reach = np.sqrt(np.maximum(hh_s[nh]**2 - d_perp_s[nh]**2, 0.0))
+                            # Same non-wrapping convention as the growth above.
+                            bleed = ((np.abs(p_x - bmin) <= p_reach)
+                                     | (np.abs(p_x - bmax) <= p_reach)
+                                     | ((p_x >= bmin) & (p_x <= bmax)))
+                            part_of_hcd_s[nh[bleed]] = True
+                    hcd_mask = np.zeros(len(den_sk), dtype=bool)
+                    hcd_mask[sort_idx] = part_of_hcd_s
+                else:
+                    # ---- PHASE 1 (and optionally 2): redshift space ----
+                    hcd_mask, _info = self._hcd_peak_mask(
+                        i_los, pos_sk, vel_sk, elem_den_sk, temp_sk, hh_sk,
+                        d_perp_sk, amumass, line, single_axis, single_cofm)
 
-                part_of_hcd_structure = np.zeros(len(den_sk), dtype=bool)
-                part_of_hcd_structure[sort_idx] = part_of_hcd_s
-                
-                # 6. Mask Application
-                if self.filter_mode == "HCD_only": 
-                    mask_keep = part_of_hcd_structure
-                else:  # "Forest_only" (filter_mode validated in __init__)
-                    mask_keep = ~part_of_hcd_structure
+                # Mask application
+                mask_keep = hcd_mask if self.filter_mode == "HCD_only" else ~hcd_mask
                 
                 # # FALLBACK: if the HCD filter found no structure along this LOS,
                 # # interpolate ALL particles rather than returning zeros.
@@ -880,8 +965,17 @@ class Spectra:
                 #     final_interpolated_array[i_los, :] = res_single[0, :]
                 #     continue
                 if not np.any(mask_keep):  #Withouth the Fallback
+                    # PERF: record the empty answer so the other two products
+                    # do not redo the whole filter to reach the same verdict.
+                    mask_list[i_los] = np.empty(0, dtype=np.intp)
                     continue
-                    
+
+                # PERF: ind_sk[mask_keep] are the indices, into the full loaded
+                # arrays, of the particles that survive for this sightline.
+                # Caching them is exactly equivalent to caching (ind_sk,
+                # mask_keep) and makes the cached branch a single fancy-index.
+                mask_list[i_los] = np.asarray(ind_sk)[mask_keep]
+
                 pos_los = pos_sk[mask_keep]
                 hh_los = hh_sk[mask_keep]
                 interp_den_los = interp_den_sk[mask_keep]
@@ -902,6 +996,194 @@ class Spectra:
 
         # Standard fast execution for Mode = "None"
         return self._do_interpolation_work(pos, vel, interp_den, temp, hh, amumass, line, get_tau)
+
+
+    def _cell_column(self, elem_den, hh, d_perp):
+        """Total column each cell deposits on the sightline, in cm^-2.
+
+        This is exactly what the C interpolator accumulates into `colden`,
+        summed over all pixels: sum(_cell_column) == sum(get_col_density) to
+        machine precision for the tophat kernel.
+
+        It replaces the old `w_attenuation`, which multiplied a DENSITY by a
+        chord length. That product is not a density, and it made the effective
+        seed threshold diverge as d_perp -> hh. A column is what the 10^17.2
+        cut is defined on, so a column is what we compare against it.
+        """
+        zr = np.sqrt(np.maximum(hh*hh - d_perp*d_perp, 0.0))
+        if self.kernel_int in (0, 2):
+            # Uniform sphere: the deposited density is 3/(4 pi) rho along the
+            # whole chord, independent of impact parameter.
+            return elem_den * (3.0/(4.0*np.pi)) * 2.0 * zr
+        z = 0.5*zr[:, None]*(_GL_X[None, :] + 1.0)
+        hsafe = np.where(hh > 0, hh, 1.0)[:, None]
+        q = np.sqrt(d_perp[:, None]**2 + z*z)/hsafe
+        if self.kernel_int == 1:
+            n = 32./4/np.pi
+            W = np.where(q >= 1, 0.0,
+                         np.where(q < 0.5, n*(1-6*q*q+6*q**3), n*2*(1-q)**3))
+        else:
+            n = 9./40/np.pi
+            W = np.where(q >= 1, 0.0,
+                 np.where(q < 1./3, n*6*(11-90*q*q+405*q**4-405*q**5),
+                 np.where(q < 2./3, n*((3-3*q)**5-6*(2-3*q)**5), n*243*(1-q)**5)))
+        return elem_den * zr * np.sum(W*_GL_W[None, :], axis=1)
+
+    @staticmethod
+    def _velocity_watershed(prof, contrast):
+        """Split a PERIODIC 1-D profile into basins, one per surviving maximum.
+
+        Two adjacent maxima are kept apart only if the saddle between them
+        lies below `contrast` times the weaker of the two, i.e. only if the
+        dip between them is deep enough to be a feature in its own right.
+        Anything shallower is merged: this is the peak-persistence step.
+
+        Periodicity is exact, not approximated: the array is rolled so its
+        global minimum sits at index 0, and the deepest valley of a closed
+        profile is always a basin boundary.
+
+        Returns (labels, peak_indices) in the ORIGINAL index frame.
+        """
+        n = prof.size
+        if n == 0 or not np.any(prof > 0):
+            return np.full(n, -1, dtype=np.intp), np.empty(0, dtype=np.intp)
+        roll = int(np.argmin(prof))
+        p = np.roll(prof, -roll)
+        gt_l = p > np.concatenate(([-np.inf], p[:-1]))
+        ge_r = p >= np.concatenate((p[1:], [-np.inf]))
+        peaks = list(np.flatnonzero(gt_l & ge_r))
+        if len(peaks) == 0:
+            return np.full(n, -1, dtype=np.intp), np.empty(0, dtype=np.intp)
+
+        def saddle_val(i):
+            return p[peaks[i]:peaks[i+1]+1].min()
+
+        while len(peaks) > 1:
+            best = None
+            for i in range(len(peaks)-1):
+                lo = min(p[peaks[i]], p[peaks[i+1]])
+                ratio = np.inf if lo <= 0 else saddle_val(i)/lo
+                if ratio > contrast and (best is None or ratio > best[0]):
+                    best = (ratio, i)
+            if best is None:
+                break
+            i = best[1]
+            peaks.pop(i if p[peaks[i]] < p[peaks[i+1]] else i+1)
+        peaks = np.array(peaks, dtype=np.intp)
+        edges = [0]
+        for i in range(len(peaks)-1):
+            seg = p[peaks[i]:peaks[i+1]+1]
+            edges.append(int(np.argmin(seg)) + peaks[i])
+        edges.append(n)
+        lab = np.empty(n, dtype=np.intp)
+        for i in range(len(peaks)):
+            lab[edges[i]:edges[i+1]] = i
+        return np.roll(lab, roll), (peaks + roll) % n
+
+    def _hcd_peak_mask(self, i_los, pos_sk, vel_sk, elem_den_sk, temp_sk,
+                       hh_sk, d_perp_sk, amumass, line, single_axis,
+                       single_cofm):
+        """Velocity-space peak decomposition (Phase 1).
+
+        Returns (mask, info): mask is True for cells belonging to an accepted
+        HCD. The decision is taken in REDSHIFT space, u = velfac*x + v_pec,
+        because that is where the absorption lands; a real-space criterion
+        cannot know whether two structures appear as one feature or two.
+        """
+        ax_idx = int(single_axis[0]) - 1
+        nb, dv = self.nbins, self.dvbin
+
+        u = np.mod(self.velfac*pos_sk[:, ax_idx] + vel_sk[:, ax_idx], self.vmax)
+        kpix = np.minimum((u/dv).astype(np.intp), nb-1)
+
+        cell_N = self._cell_column(elem_den_sk, hh_sk, d_perp_sk)
+        prof = np.bincount(kpix, weights=cell_N, minlength=nb)
+
+        sigma_pix = self.hcd_peak_smooth_kms/dv
+        prof_s = gaussian_filter1d(prof, sigma_pix, mode='wrap') if sigma_pix > 1e-3 else prof
+
+        labels, peak_pix = self._velocity_watershed(prof_s, self.hcd_peak_contrast)
+        if len(peak_pix) == 0:
+            self.hcd_basin_info[i_los] = []
+            return np.zeros(len(cell_N), dtype=bool), []
+        lab_cell = labels[kpix]
+        nbasin = len(peak_pix)
+        basin_N = np.bincount(lab_cell, weights=cell_N, minlength=nbasin)
+
+        # Halo membership is a real-space statement, so this one test stays in
+        # real space. It is applied to the cell that dominates each feature.
+        in_window = np.ones(nbasin, dtype=bool)
+        if self.halo_r200 is not None:
+            los_c = single_cofm[0, ax_idx]
+            window = self.halo_radius_cut*self.halo_r200
+            for b in range(nbasin):
+                sel = np.flatnonzero(lab_cell == b)
+                if sel.size == 0:
+                    in_window[b] = False
+                    continue
+                xpk = pos_sk[sel[np.argmax(cell_N[sel])], ax_idx]
+                d = abs(xpk - los_c)
+                in_window[b] = (min(d, self.box - d) <= window)
+
+        order = np.argsort(basin_N)[::-1]
+        accepted = (basin_N >= self.hcd_selection_thresh) & in_window
+
+        if self.hcd_algorithm == "peaks+blend" and np.any(accepted):
+            accepted = self._blend_test(accepted, order, basin_N, in_window,
+                                        lab_cell, pos_sk, vel_sk, elem_den_sk,
+                                        temp_sk, hh_sk, amumass, line,
+                                        single_axis, single_cofm)
+
+        info = [{"peak_kms": float(peak_pix[b]*dv), "N_HI": float(basin_N[b]),
+                 "in_window": bool(in_window[b]), "accepted": bool(accepted[b])}
+                for b in range(nbasin)]
+        self.hcd_basin_info[i_los] = info
+        return accepted[lab_cell], info
+
+    def _blend_test(self, accepted, order, basin_N, in_window, lab_cell,
+                    pos_sk, vel_sk, elem_den_sk, temp_sk, hh_sk, amumass,
+                    line, single_axis, single_cofm):
+        """Phase 2: re-admit sub-threshold features an observer could not
+        separate from an accepted one.
+
+        The test is done in FLUX, not in optical depth, and that is not
+        cosmetic: between two saturated components tau can fall from 1e6 to
+        20 -- a ratio of 1e-5, which any tau-based criterion would call
+        "resolved" -- while the flux there is exp(-20) = 2e-9, still
+        completely black and therefore separable by nobody. Two features are
+        separable exactly when the flux comes back up between them.
+        """
+        def tau_of(sel):
+            if not np.any(sel):
+                return np.zeros(self.nbins)
+            return self._do_interpolation_work(
+                pos_sk[sel], vel_sk[sel], elem_den_sk[sel], temp_sk[sel],
+                hh_sk[sel], amumass, line, True,
+                custom_axis=single_axis, custom_cofm=single_cofm)[0].astype(np.float64)
+
+        def recovers(tau_tot, i_a, i_c):
+            flux = np.exp(-tau_tot)
+            if self.spec_res > 0:
+                flux = gaussian_filter1d(flux, self.spec_res/self.dvbin, mode='wrap')
+            n = self.nbins
+            fwd = (i_c - i_a) % n
+            arc = (np.arange(i_a, i_a+fwd+1) % n) if fwd <= n//2 \
+                  else (np.arange(i_c, i_c+(n-fwd)+1) % n)
+            return flux[arc].max() >= self.hcd_blend_flux_thresh
+
+        tau_acc = tau_of(np.isin(lab_cell, np.flatnonzero(accepted)))
+        i_a = int(np.argmax(tau_acc))
+        for b in order:
+            if accepted[b] or not in_window[b] or basin_N[b] <= 0:
+                continue
+            sel = (lab_cell == b)
+            tau_cand = tau_of(sel)
+            if tau_cand.max() <= 0:
+                continue
+            if not recovers(tau_acc + tau_cand, i_a, int(np.argmax(tau_cand))):
+                accepted[b] = True
+                tau_acc = tau_acc + tau_cand
+        return accepted    
     
     def _read_particle_data(self, fn, elem, ion, get_tau):
             """Read the particle data for a single interpolation"""
@@ -1074,6 +1356,46 @@ class Spectra:
         ind = _near_lines(self.box, pos, hh, axis, cofm)
         return ind
 
+    def clear_caches(self):
+        """Drop the PERF caches (particle arrays and HCD masks).
+
+        They are keyed on (segment, elem, ion) and assume cofm/axis are fixed
+        for the lifetime of the object, which is how the pipeline uses it (one
+        Spectra per halo). Call this if you ever mutate self.cofm or self.axis
+        in place and then ask for another product.
+        """
+        self._particle_cache = {}
+        self._hcd_mask_cache = {}
+
+    def _get_species_column(self, fn, nelem):
+        """Read one column of GFM_Metals via an HDF5 hyperslab.
+
+        Returns None (not an exception) if the snapshot backend does not
+        expose a sliceable h5py handle, so the caller can fall back to the
+        original full-block read. Purely an I/O optimisation: the values are
+        the same as get_data(...)[:, nelem].
+        """
+        try:
+            ss = self.snapshot_set
+            files = getattr(ss, "_files", None)
+            if files is None or not hasattr(ss, "_f_handle"):
+                return None
+            if getattr(ss, "_handle_num", None) != fn:
+                ss._f_handle.close()
+                ss._f_handle = h5py.File(files[fn], 'r')
+                ss._handle_num = fn
+            dset = ss._f_handle["PartType0"]["GFM_Metals"]
+            if dset.ndim != 2 or nelem >= dset.shape[1]:
+                return None
+            return np.asarray(dset[:, nelem], dtype=np.float32)
+        except KeyError:
+            # No GFM_Metals in this snapshot: re-raise so get_mass_frac takes
+            # its documented primordial-abundance fallback rather than
+            # silently returning None.
+            raise
+        except Exception:
+            return None
+
     def get_mass_frac(self, elem, fn, ind):
         """Get the mass fraction of a given species from a snapshot.
         Arguments:
@@ -1088,7 +1410,17 @@ class Spectra:
             nelem = self.species.index(elem)
             #Get metallicity of this metal species
             try:
-                mass_frac = (self.snapshot_set.get_data(0, "GFM_Metals", segment=fn).astype(np.float32))[:, nelem]
+                # PERF: GFM_Metals is an [N, 9] block and exactly ONE column is
+                # ever used. Reading all nine and slicing afterwards costs 9x
+                # the bytes plus a full float32 copy of the discarded eight; in
+                # profiling this single statement was a third of the total
+                # runtime. Try an HDF5 hyperslab on the one column first, and
+                # fall back to the original full read if the snapshot backend
+                # does not expose a sliceable handle. Identical values either
+                # way -- this is purely how the bytes are fetched.
+                mass_frac = self._get_species_column(fn, nelem)
+                if mass_frac is None:
+                    mass_frac = (self.snapshot_set.get_data(0, "GFM_Metals", segment=fn).astype(np.float32))[:, nelem]
             except KeyError:
                 #If GFM_Metals is not defined, fall back to primordial abundances
                 metal_abund = np.array([0.76, 0.24], dtype=np.float32)
