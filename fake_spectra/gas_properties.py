@@ -25,8 +25,32 @@ class GasProperties(object):
         sf_neutral - If True (the default) then gas on the star-forming equation of state is assumed to be neutral.
         Should only be true if used with a Springel-Hernquist star formation model in a version of Gadget/Arepo which incorrectly
         sets the neutral fraction in the star forming gas to less than unity.
+
+    HCD fork options for the star-forming gas (all off by default = upstream behaviour).
+    They complete sf_neutral as in Bird et al. 2014 (arXiv:1405.3994, Sec. 2.2), where
+    star-forming gas is self-shielded, at 1e4 K, and partly molecular:
+        sf_criterion - which cells are star-forming. "density" (default, upstream):
+                  density above the Springel & Hernquist threshold computed by
+                  _get_rho_thresh. "sfr": StarFormationRate > 0, the exact flag of
+                  the simulation (TNG starts forming stars at n_H ~ 0.106 cm^-3,
+                  below the 0.12 cm^-3 of _get_rho_thresh).
+        sf_temp - None (default): the temperature of star-forming gas comes from its
+                  internal energy, i.e. the 'effective' temperature of the equation
+                  of state, which is not physical. A number (e.g. 1e4): temperature
+                  in K given to star-forming gas, consistent with treating it as
+                  cold, neutral gas. Requires sf_neutral.
+        h2_model - None (default): all the neutral star-forming gas is HI.
+                  "BR06": remove the molecular fraction of star-forming gas with the
+                  Blitz & Rosolowsky (2006) pressure relation, as in Altay et al.
+                  2011 and Bird et al. 2014 (eq. 4):
+                      f_H2 = 1 / (1 + (35 (0.1/n_H)^(5/3))^0.92),  n_H in cm^-3
+                  Non star-forming gas forms no H2. Requires sf_neutral.
         """
-    def __init__(self, redshift, absnap, hubble = 0.71, fbar=0.17, units=None, sf_neutral=True):
+    H2_MODELS = (None, "BR06")
+    SF_CRITERIA = ("density", "sfr")
+
+    def __init__(self, redshift, absnap, hubble = 0.71, fbar=0.17, units=None, sf_neutral=True,
+                 sf_criterion="density", sf_temp=None, h2_model=None):
         if units is not None:
             self.units = units
         else:
@@ -35,6 +59,20 @@ class GasProperties(object):
         self.f_bar = fbar
         self.redshift = redshift
         self.sf_neutral = sf_neutral
+        # Star-forming gas options (see the class docstring). T and H2 only make
+        # sense for gas that is already treated as neutral, so they need sf_neutral.
+        if sf_criterion not in self.SF_CRITERIA:
+            raise ValueError("sf_criterion must be one of %s, got %r" % (self.SF_CRITERIA, sf_criterion))
+        if h2_model not in self.H2_MODELS:
+            raise ValueError("h2_model must be one of %s, got %r" % (self.H2_MODELS, h2_model))
+        if (sf_temp is not None or h2_model is not None) and not sf_neutral:
+            raise ValueError("sf_temp and h2_model describe neutral star-forming gas: they need sf_neutral=True")
+        self.sf_criterion = sf_criterion
+        self.sf_temp = None if sf_temp is None else float(sf_temp)
+        self.h2_model = h2_model
+        # One-segment cache of the star-forming mask: get_temp and get_reproc_HI
+        # are called on the same segment one after the other
+        self._sf_cache = (None, None)
         #Interpolate for opacity and gamma_UVB
         #Opacities for the FG09 UVB from Rahmati 2012.
         #IMPORTANT: The values given for z > 5 are calculated by fitting a power law and extrapolating.
@@ -99,8 +137,39 @@ class GasProperties(object):
         return (B - np.sqrt(B**2-4*A*alpha_A))/(2*A)
 
     def get_temp(self,part_type, segment):
-        """Compute temperature (in K) from internal energy."""
-        return self.absnap.get_temp(part_type, segment=segment, units=self.units)
+        """Compute temperature (in K) from internal energy.
+        With sf_temp set, star-forming gas gets that temperature instead of the
+        'effective' temperature of the equation of state."""
+        temp = self.absnap.get_temp(part_type, segment=segment, units=self.units)
+        if self.sf_temp is not None:
+            sf, _ = self._star_forming(part_type, segment)
+            temp[sf] = self.sf_temp
+        return temp
+
+    def _star_forming(self, part_type, segment):
+        """Star-forming cells of one segment and their total gas density in
+        physical atoms/cm^3 (the quantity get_reproc_HI has always used).
+        Returns (boolean mask, density). The same mask is used for the neutral
+        fraction, the temperature and the H2 fraction."""
+        key = (part_type, segment, self.sf_criterion)
+        if self._sf_cache[0] == key:
+            return self._sf_cache[1]
+        density = self.absnap.get_data(part_type, "Density", segment=segment)
+        conv = np.float32(self.units.UnitDensity_in_cgs*self.hubble**2/(self.units.protonmass)*(1+self.redshift)**3)
+        if self.sf_criterion == "sfr":
+            sf = self.absnap.get_data(part_type, "StarFormationRate", segment=segment) > 0
+        else:
+            sf = density > self.PhysDensThresh/0.76/conv
+        out = (sf, density*conv)
+        self._sf_cache = (key, out)
+        return out
+
+    @staticmethod
+    def _h2_fraction_br06(nH):
+        """Molecular fraction of star-forming gas, Blitz & Rosolowsky 2006 as used
+        by Altay et al. 2011 and Bird et al. 2014 (eq. 4). nH: hydrogen density,
+        physical cm^-3. Returns M_H2 / (M_HI + M_H2)."""
+        return 1.0 / (1.0 + (35.0 * (0.1 / nH)**(5./3))**0.92)
 
     def get_code_rhoH(self,part_type, segment):
         """Convert density to physical atoms /cm^3: internal gadget density unit is h^2 (1e10 M_sun) / kpc^3"""
@@ -135,14 +204,20 @@ class GasProperties(object):
         #So just assume that at the threshold all gas is in cold clouds.
         #In reality, this should be about 90% of gas in cold clouds, so
         #we will overpredict the neutral fraction by a small amount.
-        density = self.absnap.get_data(part_type, "Density", segment=segment)
-        conv = np.float32(self.units.UnitDensity_in_cgs*self.hubble**2/(self.units.protonmass)*(1+self.redshift)**3)
-        ind = np.where(density > self.PhysDensThresh/0.76/conv)
+        # ind = star-forming cells (sf_criterion); dens_phys = density*conv,
+        # exactly the quantity used here before these options existed
+        sf, dens_phys = self._star_forming(part_type, segment)
+        ind = np.where(sf)
         if self.redshift_coverage:
-            ssnH0 = self._neutral_fraction(density[ind]*conv, 1e4)
+            ssnH0 = self._neutral_fraction(dens_phys[ind], 1e4)
             nH0[ind] = ssnH0
         else:
             nH0[ind] = 1.
+        # Part of the neutral star-forming gas is molecular, and H2 does not absorb
+        # in Lyman alpha: keep only the atomic part. n_H = 0.76 x total atoms,
+        # the hydrogen fraction used for the threshold above.
+        if self.h2_model == "BR06":
+            nH0[ind] *= 1.0 - self._h2_fraction_br06(0.76*dens_phys[ind])
         return nH0
 
     def _get_rho_thresh(self, hubble=0.7,t_0_star=2.27,T_SN=5.73e7,T_c = 1000, A_0=573):

@@ -112,6 +112,8 @@ class Spectra:
             load_halo - Whether to load the halo catalogue
             units - If not None, UnitSystem instance which overrides the default units read from the simulation.
             sf_neutral - bug fix for certain Gadget versions. See gas_properties.py
+                      Keep it True (default) for TNG: star-forming gas is then treated as
+                      self-shielded instead of using the non-physical snapshot neutral fraction.
             quiet - Whether to output debug messages
             load_snapshot - Does nothing, preserved for backwards compatibility
             gasprop - Name (not instance!) of class to compute neutral fractions and temperatures.
@@ -138,7 +140,12 @@ class Spectra:
                       (Renamed from dla_phys_thresh; same numbers, same logic.)
             halo_r200 - R200 of the target halo, simulation length units. If set,
                       only cores within +- halo_radius_cut * R200 of the halo
-                      centre (along the LOS axis) are accepted.
+                      centre (along the LOS axis) are accepted. Either one
+                      number (every sightline goes through the same halo), or
+                      an array with one R200 per sightline (len == len(cofm)),
+                      so that the sightlines of several halos can share one
+                      Spectra object, i.e. one read of the snapshot. None (the
+                      default) switches the window off: random sightlines.
             halo_radius_cut - window half-width in units of R200 (default 5).
             gap_tolerance_length - how long a hole inside a growing HCD may be
                       before the growth stops, in SIMULATION LENGTH UNITS.
@@ -456,13 +463,35 @@ class Spectra:
         # because radii_skewers builds cofm = halo_cm + offset with ZERO offset
         # along the LOS axis. If you ever generate cofm differently, the window
         # anchors wherever that coordinate points.
+        #
+        # halo_r200 may be one number or one value per sightline. Internally it
+        # is always stored per sightline (_halo_r200_los, None = no window), so
+        # the window code below reads the R200 of the sightline it is treating.
+        # A single number gives the same window for every sightline, i.e. the
+        # behaviour from before this option existed.
         self.halo_r200 = halo_r200
         self.halo_radius_cut = halo_radius_cut
+        if halo_r200 is None:
+            self._halo_r200_los = None
+        else:
+            r200 = np.asarray(halo_r200, dtype=np.float64)
+            if r200.ndim == 0:
+                r200 = np.full(self.NumLos, float(r200))
+            if r200.shape != (self.NumLos,):
+                raise ValueError("halo_r200 must be None, one number, or one value per "
+                                 "sightline (%d), got shape %s" % (self.NumLos, r200.shape))
+            if not np.all(np.isfinite(r200) & (r200 > 0)):
+                raise ValueError("halo_r200 must be finite and > 0 for every sightline")
+            self._halo_r200_los = r200
 
-        if self.filter_mode != "None" and self.halo_r200 is not None and not quiet:
+        if self.filter_mode != "None" and self._halo_r200_los is not None and not quiet:
             print(f"Halo-centric HCD core selection ENABLED:", flush=True)
-            print(f" -> R200 = {self.halo_r200} (sim units)", flush=True)
-            print(f" -> Acceptance window: ±{self.halo_radius_cut} R200 around sightline center", flush=True)        
+            if np.ndim(self.halo_r200) == 0:
+                print(f" -> R200 = {self.halo_r200} (sim units)", flush=True)
+            else:
+                print(f" -> R200 per sightline, {self._halo_r200_los.min():.4g} to "
+                      f"{self._halo_r200_los.max():.4g} (sim units)", flush=True)
+            print(f" -> Acceptance window: ±{self.halo_radius_cut} R200 around sightline center", flush=True)
 
     def save_file(self):
         """
@@ -514,7 +543,14 @@ class Spectra:
             grp.attrs["hcd_peak_contrast"] = self.hcd_peak_contrast
             grp.attrs["hcd_blend_flux_thresh"] = self.hcd_blend_flux_thresh
             grp.attrs["halo_radius_cut"] = self.halo_radius_cut
-            grp.attrs["halo_r200"] = -1.0 if self.halo_r200 is None else float(self.halo_r200)
+            # -1 = no window; -2 = one R200 per sightline, in spectra/halo_r200
+            # (an HDF5 attribute cannot hold a long array)
+            if self.halo_r200 is None:
+                grp.attrs["halo_r200"] = -1.0
+            elif np.ndim(self.halo_r200) == 0:
+                grp.attrs["halo_r200"] = float(self.halo_r200)
+            else:
+                grp.attrs["halo_r200"] = -2.0
             if self.hcd_algorithm == "region_growing":
                 grp.attrs["hcd_seed_lognhi"] = HCD_SEED_LOGNHI
                 grp.attrs["hcd_thresh_nH"] = self.hcd_phys_thresh_nH
@@ -524,6 +560,8 @@ class Spectra:
         grp = f.create_group("spectra")
         grp["cofm"] = self.cofm
         grp["axis"] = self.axis
+        if self.filter_mode != "None" and self.halo_r200 is not None and np.ndim(self.halo_r200) > 0:
+            grp["halo_r200"] = self._halo_r200_los
         #Observer tau is the strongest unsaturated line
         grp_grid = f.create_group("tau_obs")
         self._save_multihash(self.tau_obs, grp_grid)
@@ -901,11 +939,12 @@ class Spectra:
                     d_perp_s = d_perp_sk[sort_idx]
                     part_of_hcd_s = np.zeros(len(den_nH_s), dtype=bool)
                     core_indices = np.where(den_nHI_s >= self.hcd_phys_thresh_nHI)[0]
-                    if (self.halo_r200 is not None) and (len(core_indices) > 0):
+                    if (self._halo_r200_los is not None) and (len(core_indices) > 0):
                         los_center = single_cofm[0, ax_idx]
                         d_core = np.abs(x_1d_s[core_indices] - los_center)
                         d_core = np.where(d_core > self.box/2.0, self.box - d_core, d_core)
-                        core_indices = core_indices[d_core <= self.halo_radius_cut*self.halo_r200]
+                        # R200 of the halo of THIS sightline
+                        core_indices = core_indices[d_core <= self.halo_radius_cut*self._halo_r200_los[i_los]]
                     envelope_thresh_nH = self.hcd_envelope_thresh
                     gap_len = self.gap_tolerance_length
                     for idx in core_indices:
@@ -1113,9 +1152,10 @@ class Spectra:
         # Halo membership is a real-space statement, so this one test stays in
         # real space. It is applied to the cell that dominates each feature.
         in_window = np.ones(nbasin, dtype=bool)
-        if self.halo_r200 is not None:
+        if self._halo_r200_los is not None:
             los_c = single_cofm[0, ax_idx]
-            window = self.halo_radius_cut*self.halo_r200
+            # R200 of the halo of THIS sightline
+            window = self.halo_radius_cut*self._halo_r200_los[i_los]
             for b in range(nbasin):
                 sel = np.flatnonzero(lab_cell == b)
                 if sel.size == 0:
@@ -1188,28 +1228,7 @@ class Spectra:
     def _read_particle_data(self, fn, elem, ion, get_tau):
             """Read the particle data for a single interpolation"""
             pos = self.snapshot_set.get_data(0, "Position", segment=fn).astype(np.float32)
-            
-            # ======================================================================
-            # NATIVE FIX FOR MN5/AREPO: MISSING SMOOTHING LENGTH
-            # ======================================================================
-            try:
-                hh = self.snapshot_set.get_smooth_length(0, segment=fn).astype(np.float32)
-                # MN5 often silently returns arrays of zeros instead of crashing. Catch it.
-                if np.max(hh) == 0.0:
-                    raise ValueError("Silent zero array detected")
-            except Exception:
-                # Reconstruct Volumetric Radius from Mass and Density: h = (3V / 4*pi)^(1/3)
-                try:
-                    mass = self.snapshot_set.get_data(0, "Masses", segment=fn).astype(np.float32)
-                except Exception:
-                    mass = self.snapshot_set.get_data(0, "Mass", segment=fn).astype(np.float32)
-                
-                rho = self.snapshot_set.get_data(0, "Density", segment=fn).astype(np.float32)
-                volume = mass / rho
-                #hh = (3.0 * volume / (4.0 * np.pi))**(1.0 / 3.0) corrected to:
-                hh = volume**(1.0 / 3.0)
-                hh = hh.astype(np.float32)
-            # ======================================================================
+            hh = self.snapshot_set.get_smooth_length(0, segment=fn).astype(np.float32)
 
             #Find particles we care about
             if self.cofm_final:
@@ -1249,20 +1268,18 @@ class Spectra:
             #Find the mass fraction in this ion
             elem_den = (den*self.rscale)*self.get_mass_frac(elem, fn, ind)
             
-            # ======================================================================
-            # NATIVE FIX FOR MN5: DIRECT NEUTRAL FRACTION OVERRIDE
-            # ======================================================================
+            #Special case H1:
             if elem == 'H' and ion == 1:
-                try:
-                    # Force direct read of the MN5 block to prevent recalculation errors
-                    nhi_frac = self.snapshot_set.get_data(0, "NeutralHydrogenAbundance", segment=fn).astype(np.float32)[ind]
-                except Exception:
-                    # Standard fallback
-                    nhi_frac = (self.gasprop.get_reproc_HI(0, segment=fn)[ind]).astype(np.float32)
-                
-                elem_den *= nhi_frac
-            # ======================================================================
-            
+                # Neutral hydrogen mass frac. get_reproc_HI starts from the
+                # snapshot's NeutralHydrogenAbundance and, with sf_neutral=True
+                # (the default), replaces it in star-forming gas by the
+                # self-shielded value. This is the right physics for TNG: there
+                # the snapshot value of star-forming cells uses the effective
+                # temperature of the equation of state, which is not physical
+                # (TNG data specifications: "use with caution for star-forming
+                # gas"). Do NOT read NeutralHydrogenAbundance directly here: that
+                # silently drops the correction and lowers N_HI in halo cores.
+                elem_den *= (self.gasprop.get_reproc_HI(0, segment=fn)[ind]).astype(np.float32)
             elif ion != -1:
                 ind2 = self._filter_particles(elem_den, pos, vel, den)
                 if np.size(ind2) == 0:
